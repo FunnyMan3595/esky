@@ -65,7 +65,7 @@ The on-disk layout of an app managed by esky looks like this:
         esky-bootstrap.txt   - list of files expected in the bootstrapping env
         ...other deps...
 
-This is also the layout of the zipfiles produced by bdist_esky.  The 
+This is also the layout of the zipfiles produced by bdist_esky.  The
 "appname-X.Y" directory is simply a frozen app directory with some extra
 bootstrapping information in the file "esky-bootstrap.txt".
 
@@ -112,13 +112,13 @@ try:
     import fcntl
 except ImportError:
     fcntl = None
-            
+
 
 from esky.errors import *
 from esky.fstransact import FSTransaction
-from esky.finder import DefaultVersionFinder
+from esky.summary_finder import SummaryVersionFinder, VersionNumber
 from esky.util import split_app_version, join_app_version,\
-                      parse_version, get_best_version, appdir_from_executable
+                      get_best_version, appdir_from_executable
 
 
 class Esky(object):
@@ -136,8 +136,8 @@ class Esky(object):
     The first argument must be either the top-level application directory,
     or the path of an executable from that application.  The second argument
     is a VersionFinder object that will be used to search for updates.  If
-    a string it passed, it is assumed to be a URL and is passed to a new 
-    DefaultVersionFinder instance.
+    a string it passed, it is assumed to be a URL and is passed to a new
+    SummaryVersionFinder instance.
     """
 
     lock_timeout = 60*60  # 1 hour
@@ -161,8 +161,7 @@ class Esky(object):
         workdir = os.path.join(self.appdir,"updates")
         if version_finder is not None:
             if isinstance(version_finder,basestring):
-               kwds = {"download_url":version_finder}
-               version_finder = DefaultVersionFinder(**kwds)
+               version_finder = SummaryVersionFinder(version_finder)
         self.__version_finder = version_finder
     version_finder = property(_get_version_finder,_set_version_finder)
 
@@ -192,7 +191,7 @@ class Esky(object):
 
         Locking is achieved by creating a "locked" directory and writing the
         current process/thread ID into it.  os.mkdir is atomic on all platforms
-        that we care about. 
+        that we care about.
         """
         if num_retries > 5:
             raise EskyLockedError
@@ -239,7 +238,7 @@ class Esky(object):
             open(os.path.join(lockdir,myid),"wb").close()
             self._lock_count = 1
             return True
-            
+
     def unlock(self):
         """Unlock the application directory for exclusive write access."""
         self._lock_count -= 1
@@ -341,7 +340,7 @@ class Esky(object):
             raise NoVersionFinderError
         version = self.find_update()
         if version is not None:
-            assert parse_version(version) > parse_version(self.version)
+            assert VersionNumber(version) > VersionNumber(self.version)
             self.fetch_version(version)
             self.install_version(version)
             try:
@@ -359,9 +358,9 @@ class Esky(object):
         if self.version_finder is None:
             raise NoVersionFinderError
         best_version = None
-        best_version_p = parse_version(self.version)
+        best_version_p = VersionNumber(self.version)
         for version in self.version_finder.find_versions(self):
-            version_p = parse_version(version)
+            version_p = VersionNumber(version)
             if version_p > best_version_p:
                 best_version_p = version_p
                 best_version = version
@@ -378,7 +377,7 @@ class Esky(object):
         """Install the specified version of the app.
 
         This fetches the specified version if necessary, then makes it
-        available as a version directory inside the app directory.  It 
+        available as a version directory inside the app directory.  It
         does not modify any other installed versions.
         """
         #  Extract update then rename into position in main app directory
@@ -412,7 +411,7 @@ class Esky(object):
         finally:
             self.unlock()
 
-    def uninstall_version(self,version): 
+    def uninstall_version(self,version):
         """Uninstall the specified version of the app."""
         target_name = join_app_version(self.name,version,self.platform)
         target = os.path.join(self.appdir,target_name)
@@ -431,7 +430,7 @@ class Esky(object):
                     details = split_app_version(vname)
                     if details[0] != self.name:
                         continue
-                    if parse_version(details[1]) < parse_version(version):
+                    if VersionNumber(details[1]) < VersionNumber(version):
                         continue
                     to_keep.update(self._version_manifest(vname))
                 #  Remove files used only by the version being removed
