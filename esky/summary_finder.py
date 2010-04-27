@@ -150,6 +150,9 @@ are unsupported and may raise an exception or give invalid results.
         if isinstance(version_string, VersionNumber):
             version_string = str(version_string)
 
+        # Keep the string so that str(VersionNumber(x)) == x.
+        self.original_string = version_string
+
         self.invalid = False
         try:
             # Check for and remove any wildcard.
@@ -203,9 +206,6 @@ are unsupported and may raise an exception or give invalid results.
 
             # Mark this object as invalid.
             self.invalid = True
-
-            # Keep the string for later error messages.
-            self.original_string = version_string
 
     def __contains__(self, other):
         if self.wildcard:
@@ -377,9 +377,11 @@ are unsupported and may raise an exception or give invalid results.
         return False
 
     def __str__(self):
+        return self.original_string
+
+    def get_canonical_form(self):
         """Returns the canonical string for this version number."""
-        # For error reporting, invalid version numbers preserve the version
-        # string which failed to parse.
+        # If invalid, return the string which failed to parse.
         if self.invalid:
             return self.original_string
 
