@@ -335,19 +335,22 @@ class Esky(object):
                          errno.EISDIR, errno.EINVAL, errno.ENOTEMPTY,)
 
     def auto_update(self):
-        """Automatically install the latest version of the app."""
+        """
+        Automatically install the latest version of the app.
+
+        Returns the update's version string or None if no update is found.
+        """
         if self.version_finder is None:
             raise NoVersionFinderError
         version = self.find_update()
         if version is not None:
             assert VersionNumber(version) > VersionNumber(self.version)
-            self.fetch_version(version)
-            self.install_version(version)
-            try:
-                self.uninstall_version(self.version)
-            except VersionLockedError:
-                pass
-            self.reinitialize()
+            target_dir = join_app_version(self.name,str(version),self.platform)
+            if not os.path.exists(os.path.join(self.appdir, target_dir)):
+                self.fetch_version(version)
+                self.install_version(version)
+            return str(version)
+        return None
 
     def find_update(self):
         """Check for an available update to this app.
