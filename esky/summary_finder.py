@@ -840,7 +840,11 @@ as these files cannot be handled by the unix "patch" command.
                     shutil.copy2(bootstrap_path, dest_path)
 
     def has_version(self, app, version):
-        return os.path.exists(self._get_ready_name(app, version))
+        ready_name = self._get_ready_name(app, version)
+        if os.path.exists(ready_name):
+            return ready_name
+        else:
+            return False
 
     def _get_ready_name(self,app,version):
         version = join_app_version(app.name, version, app.platform)
