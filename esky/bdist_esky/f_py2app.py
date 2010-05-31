@@ -1,4 +1,4 @@
-#  Copyright (c) 2009, Cloud Matrix Pty. Ltd.
+#  Copyright (c) 2009-2010, Cloud Matrix Pty. Ltd.
 #  All rights reserved; available under the terms of the BSD License.
 """
 
@@ -32,7 +32,7 @@ def freeze(dist):
     includes = dist.includes
     excludes = dist.excludes
     options = dist.freezer_options
-    #  Merge in any encludes/excludes given in freezer_options
+    #  Merge in any includes/excludes given in freezer_options
     includes.append("esky")
     for inc in options.pop("includes",()):
         includes.append(inc)
@@ -61,7 +61,7 @@ def freeze(dist):
             os.rename(os.path.join(dist.freeze_dir,nm,nm2),
                       os.path.join(dist.freeze_dir,nm2))
             os.rmdir(os.path.join(dist.freeze_dir,nm))
-    #  Remove any pyc files with a corresponding py file
+    #  Remove any .pyc files with a corresponding .py file
     resdir = os.path.join(dist.freeze_dir,"Contents/Resources")
     for (dirnm,_,filenms) in os.walk(resdir):
         for nm in filenms:
@@ -103,6 +103,7 @@ def freeze(dist):
     code_source = [inspect.getsource(esky.bootstrap)]
     code_source.append(_FAKE_ESKY_BOOTSTRAP_MODULE)
     code_source.append(_EXTRA_BOOTSTRAP_CODE)
+    code_source.append("__esky_name__ = '%s'" % (dist.distribution.get_name(),))
     if dist.bootstrap_module is None:
         code_source.append("bootstrap()")
     else:
@@ -120,6 +121,8 @@ def freeze(dist):
     #  Copy the loader program for each script into the bootstrap env.
     dist.copy_to_bootstrap_env("Contents/MacOS/python")
     for exe in dist.get_executables():
+        if not exe.include_in_bootstrap_env:
+            continue
         exepath = dist.copy_to_bootstrap_env("Contents/MacOS/"+exe.name)
 
 
@@ -128,9 +131,22 @@ def _make_py2app_cmd(dist_dir,distribution,options,exe):
     for (nm,val) in options.iteritems():
         setattr(cmd,nm,val)
     cmd.dist_dir = dist_dir
-    cmd.app = [Target(script=exe,prescripts=[StringIO(_EXE_PRESCRIPT_CODE)])]
+    cmd.app = [Target(script=exe.script,dest_base=exe.name,
+                      prescripts=[StringIO(_EXE_PRESCRIPT_CODE)])]
     cmd.finalize_options()
     cmd.plist["CFBundleExecutable"] = exe.name
+    old_run = cmd.run
+    def new_run():
+        old_run()
+        #  We need to script file to have the same name as the exe, which
+        #  it won't if they have changed it explicitly.
+        resdir = os.path.join(dist_dir,distribution.get_name()+".app","Contents/Resources")
+        scriptf = os.path.join(resdir,exe.name+".py")
+        if not os.path.exists(scriptf):
+           old_scriptf = os.path.basename(exe.script)
+           old_scriptf = os.path.join(resdir,old_scriptf)
+           shutil.move(old_scriptf,scriptf)
+    cmd.run = new_run
     return cmd
 
 
@@ -138,7 +154,6 @@ def _merge_dir(src,dst):
     if not os.path.isdir(dst):
         os.makedirs(dst)
     for nm in os.listdir(src):
-        print "  NM", nm
         srcnm = os.path.join(src,nm)
         dstnm = os.path.join(dst,nm)
         if os.path.isdir(srcnm):
@@ -166,9 +181,9 @@ sys.argv[0] = environ["ARGVZERO"]
 """
 
 
-#  py2app isn't designed for freezing multiple exes, its standard
-#  bootstrap code runs a fixed script.  This gets inserted into the
-#  bootstrap code and inspects the environment to find the actual script
+#  py2app isn't designed for freezing multiple exes, so its standard
+#  bootstrap code runs a fixed script.  This code gets inserted into the
+#  bootstrap code to inspect the environment and find the actual script
 #  to be run.
 _EXE_PRESCRIPT_CODE = """
 import os

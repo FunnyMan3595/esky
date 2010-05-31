@@ -1,4 +1,4 @@
-#  Copyright (c) 2009, Cloud Matrix Pty. Ltd.
+#  Copyright (c) 2009-2010, Cloud Matrix Pty. Ltd.
 #  All rights reserved; available under the terms of the BSD License.
 """
 
@@ -24,6 +24,8 @@ import sys
 import shutil
 import os
 
+from esky.util import get_backup_filename
+
 #  Try to access the transacted filesystem APIs on win32
 CreateTransaction = None
 if sys.platform == "win32":
@@ -47,28 +49,42 @@ if sys.platform == "win32":
             CreateTransaction = None
 
 
-def files_differ(file1,file2):
+def files_differ(file1,file2,start=0,stop=None):
     """Check whether two files are actually different."""
     try:
         stat1 = os.stat(file1)
         stat2 = os.stat(file2)
     except EnvironmentError:
          return True
-    if stat1.st_size != stat2.st_size:
+    if stop is None and stat1.st_size != stat2.st_size:
         return True
-    assert not os.path.isdir(file1)
-    assert not os.path.isdir(file2)
     f1 = open(file1,"rb")
     try:
         f2 = open(file2,"rb")
+        if start >= stat1.st_size:
+            return False
+        elif start < 0:
+            start = stat1.st_size + start
+        if stop is None or stop > stat1.st_size:
+            stop = stat1.st_size
+        elif stop < 0:
+            stop = stat1.st_size + stop
+        if stop <= start:
+            return False
+        toread = stop - start
+        f1.seek(start)
+        f2.seek(start)
         try:
-            data1 = f1.read(1024*256)
-            data2 = f2.read(1024*256)
-            while data1 and data2:
+            sz = min(1024*256,toread)
+            data1 = f1.read(sz)
+            data2 = f2.read(sz)
+            while sz > 0 and data1 and data2:
                 if data1 != data2:
                     return True
-                data1 = f1.read(1024*256)
-                data2 = f2.read(1024*256)
+                toread -= sz
+                sz = min(1024*256,toread)
+                data1 = f1.read(sz)
+                data2 = f2.read(sz)
             return (data1 != data2)
         finally:
             f2.close()
@@ -111,9 +127,7 @@ if CreateTransaction:
             source = source.encode(sys.getfilesystemencoding())
             target = target.encode(sys.getfilesystemencoding())
             if os.path.exists(target):
-                target_old = target + ".old"
-                while os.path.exists(target_old):
-                    target_old += ".old"
+                target_old = get_backup_filename(target)
                 MoveFileTransacted(target,target_old,None,None,1,self.trnid)
                 MoveFileTransacted(source,target,None,None,1,self.trnid)
                 try:
@@ -121,7 +135,16 @@ if CreateTransaction:
                 except EnvironmentError:
                     pass
             else:
+                self._create_parents(target)
                 MoveFileTransacted(source,target,None,None,1,self.trnid)
+
+
+        def _create_parents(self,target):
+            parents = [target]
+            while not os.path.exists(os.path.dirname(parents[-1])):
+                parents.append(os.path.dirname(parents[-1]))
+            for parent in reversed(parents[1:]):
+                CreateDirectoryTransacted(None,parent,0,self.trnid)
 
         def copy(self,source,target):
             if os.path.isdir(source):
@@ -143,9 +166,7 @@ if CreateTransaction:
             source = source.encode(sys.getfilesystemencoding())
             target = target.encode(sys.getfilesystemencoding())
             if os.path.exists(target):
-                target_old = target + ".old"
-                while os.path.exists(target_old):
-                    target_old += ".old"
+                target_old = get_backup_filename(target)
                 MoveFileTransacted(target,target_old,None,None,1,self.trnid)
                 self._do_copy(source,target)
                 try:
@@ -155,15 +176,14 @@ if CreateTransaction:
             else:
                 target_old = None
                 if os.path.isdir(target):
-                    target_old = target + ".old"
-                    while os.path.exists(target_old):
-                        target_old += ".old"
+                    target_old = get_backup_filename(target)
                     MoveFileTransacted(target,target_old,None,None,1,self.trnid)
                 self._do_copy(source,target)
                 if target_old is not None:
                     self.remove(target_old)
 
         def _do_copy(self,source,target):
+            self._create_parents(target)
             if os.path.isdir(source):
                 CreateDirectoryTransacted(None,target,0,self.trnid)
                 for nm in os.listdir(source):
@@ -249,9 +269,17 @@ else:
                     while os.path.exists(target_old):
                         target_old = target_old + ".old"
                     os.rename(target,target_old)
+                self._create_parents(target)
                 os.rename(source,target)
                 if target_old is not None:
                     self._remove(target_old)
+
+        def _create_parents(self,target):
+            parents = [target]
+            while not os.path.exists(os.path.dirname(parents[-1])):
+                parents.append(os.path.dirname(parents[-1]))
+            for parent in reversed(parents[1:]):
+                os.mkdir(parent)
 
         def copy(self,source,target):
             if os.path.isdir(source):
@@ -271,9 +299,7 @@ else:
 
         def _copy(self,source,target):
             if sys.platform == "win32" and os.path.exists(target):
-                target_old = target + ".old"
-                while os.path.exists(target_old):
-                    target_old = target_old + ".old"
+                target_old = get_backup_filename(target)
                 os.rename(target,target_old)
                 try:
                     self._do_copy(source,target)
@@ -288,20 +314,17 @@ else:
             else:
                 target_old = None
                 if os.path.isdir(target) and os.path.isfile(source):
-                    target_old = target + ".old"
-                    while os.path.exists(target_old):
-                        target_old = target_old + ".old"
+                    target_old = get_backup_filename(target)
                     os.rename(target,target_old)
                 elif os.path.isfile(target) and os.path.isdir(source):
-                    target_old = target + ".old"
-                    while os.path.exists(target_old):
-                        target_old = target_old + ".old"
+                    target_old = get_backup_filename(target)
                     os.rename(target,target_old)
                 self._do_copy(source,target)
                 if target_old is not None:
                     self._remove(target_old)
 
         def _do_copy(self,source,target):
+            self._create_parents(target)
             if os.path.isfile(source):
                 shutil.copy2(source,target)
             else:
@@ -324,4 +347,5 @@ else:
 
         def abort(self):
             del self.pending[:]
+
 

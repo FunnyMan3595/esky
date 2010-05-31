@@ -1,4 +1,4 @@
-#  Copyright (c) 2009, Cloud Matrix Pty. Ltd.
+#  Copyright (c) 2009-2010, Cloud Matrix Pty. Ltd.
 #  All rights reserved; available under the terms of the BSD License.
 """
 
@@ -55,13 +55,14 @@ def freeze(dist):
     kwds["includes"] = includes
     kwds["excludes"] = excludes
     kwds["targetDir"] = dist.freeze_dir
-    #  Build an Executable object for each script
+    #  Build an Executable object for each script.
+    #  To include the esky startup code, we write each to a tempdir.
     executables = []
     for exe in dist.get_executables():
         base = None
         if exe.gui_only and sys.platform == "win32":
             base = "Win32GUI"
-        executables.append(cx_Freeze.Executable(exe.script,base=base,icon=exe.icon,**exe._kwds))
+        executables.append(cx_Freeze.Executable(exe.script,base=base,targetName=exe.name,icon=exe.icon,**exe._kwds))
     #  Freeze up the executables
     f = cx_Freeze.Freezer(executables,**kwds)
     f.Freeze()
@@ -87,6 +88,7 @@ def freeze(dist):
     code_source = [inspect.getsource(esky.bootstrap)]
     if sys.platform == "win32":
         code_source.append(_CUSTOM_WIN32_CHAINLOADER)
+    code_source.append("__esky_name__ = '%s'" % (dist.distribution.get_name(),))
     if dist.bootstrap_module is None:
         code_source.append("bootstrap()")
     else:
@@ -110,7 +112,9 @@ def freeze(dist):
             dist.copy_to_bootstrap_env(nm)
     #  Copy the loader program for each script into the bootstrap env, and
     #  append the bootstrapping code to it as a zipfile.
-    for exe in dist.get_executables():
+    for exe in dist.get_executables(rewrite=False):
+        if not exe.include_in_bootstrap_env:
+            continue
         exepath = dist.copy_to_bootstrap_env(exe.name)
         bslib = zipfile.PyZipFile(exepath,"a",zipfile.ZIP_STORED)
         cdate = (2000,1,1,0,0,0)
@@ -123,7 +127,7 @@ def freeze(dist):
 def _normalise_opt_name(nm):
     """Normalise option names for cx_Freeze.
 
-    This allows people to specicy options named like "opt-name" and have
+    This allows people to specify options named like "opt-name" and have
     them converted to the "optName" format used internally by cx_Freeze.
     """
     bits = nm.split("-")
@@ -167,7 +171,15 @@ def _chainload(target_dir):
               EXCLUSIVE_ZIP_FILE_NAME = EXCLUSIVE_ZIP_FILE_NAME.replace(mydir,target_dir)
               SHARED_ZIP_FILE_NAME = SHARED_ZIP_FILE_NAME.replace(mydir,target_dir)
               INITSCRIPT_ZIP_FILE_NAME = init_path
-              exec code in globals()
+              try:
+                  exec code in globals()
+              except zipimport.ZipImportError, e:
+                  #  If it can't find the __main__{sys.executable} script,
+                  #  the user might be running from a backup exe file.
+                  #  Fall back to original chainloader to attempt workaround.
+                  if e.message.endswith("__main__'"):
+                      _orig_chainload(target_dir)
+                  raise
               sys.exit(0)
       else:
           _orig_chainload(target_dir)

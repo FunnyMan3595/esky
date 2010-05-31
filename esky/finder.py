@@ -1,4 +1,4 @@
-#  Copyright (c) 2009, Cloud Matrix Pty. Ltd.
+#  Copyright (c) 2009-2010, Cloud Matrix Pty. Ltd.
 #  All rights reserved; available under the terms of the BSD License.
 """
 
@@ -22,7 +22,7 @@ from urlparse import urlparse, urljoin
 
 from esky.bootstrap import parse_version, join_app_version
 from esky.errors import *
-from esky.util import extract_zipfile
+from esky.util import extract_zipfile, copy_ownership_info
 from esky.patch import apply_patch, PatchError
 
 
@@ -60,7 +60,10 @@ class VersionFinder(object):
         raise NotImplementedError
 
     def has_version(self,app,version):
-        """Check whether a specific version of the app is available locally."""
+        """Check whether a specific version of the app is available locally.
+
+        Returns either False, or the paths to the unpacked version directory.
+        """
         raise NotImplementedError
 
 
@@ -86,12 +89,16 @@ class DefaultVersionFinder(VersionFinder):
 
     def _workdir(self,app,nm):
         """Get full path of named working directory, inside the given app."""
-        workdir = os.path.join(app._get_update_dir(),nm)
-        try:
-            os.makedirs(workdir)
-        except OSError, e:
-            if e.errno not in (17,183):
-                raise
+        updir = app._get_update_dir()
+        workdir = os.path.join(updir,nm)
+        for target in (updir,workdir):
+            try:
+                os.mkdir(target)
+            except OSError, e:
+                if e.errno not in (17,183):
+                    raise
+            else:
+                copy_ownership_info(app.appdir,target)
         return workdir
 
     def cleanup(self,app):
@@ -115,10 +122,10 @@ class DefaultVersionFinder(VersionFinder):
         appname_re = join_app_version(app.name,appname_re,app.platform)
         filename_re = "%s\\.(zip|exe|from-(?P<from_version>%s)\\.patch)"
         filename_re = filename_re % (appname_re,version_re,)
-        link_re = "href=['\"](?P<href>(.*/)?%s)['\"]" % (filename_re,)
+        link_re = "href=['\"](?P<href>([^'\"]*/)?%s)['\"]" % (filename_re,)
         # TODO: would be nice not to have to guess encoding here.
         downloads = self.open_url(self.download_url).read().decode("utf-8")
-        for match in re.finditer(link_re,downloads):
+        for match in re.finditer(link_re,downloads,re.I):
             version = match.group("version")
             href = match.group("href")
             from_version = match.group("from_version")
@@ -134,8 +141,12 @@ class DefaultVersionFinder(VersionFinder):
         #  There's always the possibility that a patch fails to apply.
         #  _prepare_version will remove such patches from the version graph;
         #  we loop until we find a path that applies, or we run out of options.
-        while True:
-            path = self.version_graph.get_best_path(app.version,version)
+        name = self._ready_name(app,version)
+        while not os.path.exists(name):
+            try:
+                path = self.version_graph.get_best_path(app.version,version)
+            except KeyError:
+                raise EskyVersionError(version)
             if path is None:
                 raise EskyVersionError(version)
             local_path = []
@@ -145,8 +156,7 @@ class DefaultVersionFinder(VersionFinder):
                 self._prepare_version(app,version,local_path)
             except PatchError:
                 pass
-            else:
-                return self._ready_name(app,version)
+        return name
 
     def _fetch_file(self,app,url):
         infile = self.open_url(urljoin(self.download_url,url))
@@ -179,37 +189,50 @@ class DefaultVersionFinder(VersionFinder):
         directory ready for renaming into the appdir.
         """
         uppath = tempfile.mkdtemp(dir=self._workdir(app,"unpack"))
-        if not path:
-            self._copy_best_version(app,uppath)
-        else:
-            if path[0][0].endswith(".patch"):
+        try:
+            if not path:
                 self._copy_best_version(app,uppath)
-                patches = path
             else:
-                extract_zipfile(path[0][0],uppath)
-                patches = path[1:]
-            for (patchfile,patchurl) in patches:
-                try:
-                    with open(patchfile,"rb") as f:
-                        apply_patch(uppath,f)
-                except PatchError:
-                    self.version_graph.remove_all_links(patchurl)
-                    raise
-        # Move anything that's not the version dir into esky-bootstrap
-        vdir = join_app_version(app.name,version,app.platform)
-        bspath = os.path.join(uppath,vdir,"esky-bootstrap")
-        if not os.path.isdir(bspath):
-            os.makedirs(bspath)
-        for nm in os.listdir(uppath):
-            if nm != vdir:
-                os.rename(os.path.join(uppath,nm),os.path.join(bspath,nm))
-        # Make it available for upgrading
-        rdpath = self._ready_name(app,version)
-        if os.path.exists(rdpath):
-            shutil.rmtree(rdpath)
-        os.rename(os.path.join(uppath,vdir),rdpath)
-        for (filenm,_) in path:
-            os.unlink(filenm)
+                if path[0][0].endswith(".patch"):
+                    try:
+                        self._copy_best_version(app,uppath)
+                    except EnvironmentError, e:
+                        self.version_graph.remove_all_links(path[0][1])
+                        err = "couldn't copy current version: %s" % (e,)
+                        raise PatchError(err)
+                    patches = path
+                else:
+                    extract_zipfile(path[0][0],uppath)
+                    patches = path[1:]
+                for (patchfile,patchurl) in patches:
+                    try:
+                        with open(patchfile,"rb") as f:
+                            apply_patch(uppath,f)
+                    except PatchError:
+                        self.version_graph.remove_all_links(patchurl)
+                        raise
+            # Move anything that's not the version dir into esky-bootstrap
+            vdir = join_app_version(app.name,version,app.platform)
+            bspath = os.path.join(uppath,vdir,"esky-bootstrap")
+            if not os.path.isdir(bspath):
+                os.makedirs(bspath)
+            for nm in os.listdir(uppath):
+                if nm != vdir:
+                    os.rename(os.path.join(uppath,nm),os.path.join(bspath,nm))
+            # Check that it has an esky-bootstrap.txt file
+            bsfile = os.path.join(uppath,vdir,"esky-bootstrap.txt")
+            if not os.path.exists(bsfile):
+                self.version_graph.remove_all_links(path[0][1])
+                raise PatchError("patch didn't create esky-bootstrap.txt")
+            # Make it available for upgrading
+            rdpath = self._ready_name(app,version)
+            if os.path.exists(rdpath):
+                shutil.rmtree(rdpath)
+            os.rename(os.path.join(uppath,vdir),rdpath)
+            for (filenm,_) in path:
+                os.unlink(filenm)
+        finally:
+            shutil.rmtree(uppath)
 
     def _copy_best_version(self,app,uppath):
         best_vdir = join_app_version(app.name,app.version,app.platform)
@@ -228,11 +251,62 @@ class DefaultVersionFinder(VersionFinder):
                     shutil.copy2(bspath,dstpath)
 
     def has_version(self,app,version):
-        return os.path.exists(self._ready_name(app,version))
+        path = self._ready_name(app,version)
+        if os.path.exists(path):
+            return path
+        return False
 
     def _ready_name(self,app,version):
         version = join_app_version(app.name,version,app.platform)
         return os.path.join(self._workdir(app,"ready"),version)
+
+
+class LocalVersionFinder(DefaultVersionFinder):
+    """VersionFinder that looks only in a local directory.
+
+    This VersionFinder subclass looks for updates in a specific local
+    directory.  It's probably only useful for testing purposes.
+    """
+
+    def find_versions(self,app):
+        version_re = "[a-zA-Z0-9\\.-_]+"
+        appname_re = "(?P<version>%s)" % (version_re,)
+        appname_re = join_app_version(app.name,appname_re,app.platform)
+        filename_re = "%s\\.(zip|exe|from-(?P<from_version>%s)\\.patch)"
+        filename_re = filename_re % (appname_re,version_re,)
+        for nm in os.listdir(self.download_url):
+            match = re.match(filename_re,nm)
+            if match:
+                version = match.group("version")
+                from_version = match.group("from_version")
+                if from_version is None:
+                    cost = 40
+                else:
+                    cost = 1
+                self.version_graph.add_link(from_version or "",version,nm,cost)
+        return self.version_graph.get_versions(app.version)
+
+    def _fetch_file(self,app,nm):
+        infile = open(os.path.join(self.download_url,nm),"rb")
+        outfilenm = os.path.join(self._workdir(app,"downloads"),nm)
+        if not os.path.exists(outfilenm):
+            partfilenm = outfilenm + ".part"
+            partfile = open(partfilenm,"wb")
+            try:
+                data = infile.read(1024*512)
+                while data:
+                    partfile.write(data)
+                    data = infile.read(1024*512)
+            except Exception:
+                infile.close()
+                partfile.close()
+                os.unlink(partfilenm)
+                raise
+            else:
+                infile.close()
+                partfile.close()
+                os.rename(partfilenm,outfilenm)
+        return outfilenm
 
 
 class VersionGraph(object):
@@ -292,7 +366,7 @@ class VersionGraph(object):
         """
         remaining = set(v for v in self._links)
         best_costs = dict((v,_inf) for v in remaining)
-        best_paths = dict((v,"") for v in remaining)
+        best_paths = dict((v,None) for v in remaining)
         best_costs[source] = 0
         best_paths[source] = []
         best_costs[""] = 0

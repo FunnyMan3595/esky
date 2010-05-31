@@ -1,4 +1,4 @@
-#  Copyright (c) 2009, Cloud Matrix Pty. Ltd.
+#  Copyright (c) 2009-2010, Cloud Matrix Pty. Ltd.
 #  All rights reserved; available under the terms of the BSD License.
 """
 
@@ -22,7 +22,9 @@ use during the bootstrap process:
   Chainloading:         execv, chainload
   Filesystem:           listdir, exists, basename, dirname, pathjoin
   Version handling:     split_app_version, join_app_version, parse_version,
-                        get_all_version, get_best_version
+                        get_all_versions, get_best_version, is_version_dir,
+                        is_installed_version_dir, is_uninstalled_version_dir,
+                        lock_version_dir, unlock_version_dir
 
 
 """
@@ -33,16 +35,18 @@ import errno
 #  The os module is not builtin, so we grab what we can from the
 #  platform-specific modules and fudge the rest.
 if "posix" in sys.builtin_module_names:
+    import fcntl
     from posix import listdir, stat, unlink, rename, execv
     SEP = "/"
-    try:
-        import fcntl
-    except ImportError:
-        fcntl = None
 elif "nt" in sys.builtin_module_names:
+    fcntl = None
     from nt import listdir, stat, unlink, rename, spawnv, P_WAIT
     SEP = "\\"
-    fcntl = None
+    #  The standard execv terminates the spawning process, which makes
+    #  it impossible to wait for it.  This alternative is waitable, but
+    #  risks leaving zombie children if it is killed externally.
+    #  TODO: some way to kill children when this is killed - should be doable
+    #        with some custom code in child startup.
     def execv(filename,args):
         res = spawnv(P_WAIT,filename,args)
         raise SystemExit(res)
@@ -67,7 +71,7 @@ def exists(path):
     try:
         stat(path)
     except EnvironmentError, e:
-        if e.errno not in (errno.ENOENT,errno.ENOTDIR,):
+        if e.errno not in (errno.ENOENT,errno.ENOTDIR,errno.ESRCH,):
             raise
         else:
             return False
@@ -102,7 +106,11 @@ def bootstrap():
     chain-loads that version of the application.
     """
     appdir = appdir_from_executable(sys.executable)
-    best_version = get_best_version(appdir)
+    best_version = None
+    if __esky_name__ is not None:
+        best_version = get_best_version(appdir,appname=__esky_name__)
+    if best_version is None:
+        best_version = get_best_version(appdir)
     if best_version is None:
         raise RuntimeError("no usable frozen versions were found")
     return chainload(pathjoin(appdir,best_version))
@@ -118,20 +126,12 @@ def chainload(target_dir):
     it will not be removed by any simultaneously-running instances of the
     application.
     """
-    global _version_dir_lockfile
-    lockfile = pathjoin(target_dir,"esky-bootstrap.txt")
     try:
-        #  On windows, holding the file open is enough to lock it.
-        #  On other platforms, try for a shared lock using fcntl.
-        _version_dir_lockfile = open(lockfile,"r")
-        if "nt" not in sys.builtin_module_names:
-            if fcntl is not None:
-                fd = _version_dir_lockfile.fileno()
-                fcntl.lockf(fd,fcntl.LOCK_SH)
+        lock_version_dir(target_dir)
     except EnvironmentError:
-        #  If the lockfile has gone missing, the version is being uninstalled.
+        #  If the bootstrap file is missing, the version is being uninstalled.
         #  Our only option is to re-execute ourself and find the new version.
-        if exists(lockfile):
+        if exists(pathjoin(target_dir,"esky-bootstrap.txt")):
             raise
         execv(sys.executable,sys.argv)
     else:
@@ -147,10 +147,19 @@ def _chainload(target_dir):
     """
     appdir = dirname(target_dir)
     target_exe = target_dir + sys.executable[len(appdir):]
-    execv(target_exe,[target_exe] + sys.argv[1:])
+    try:
+        execv(target_exe,[target_exe] + sys.argv[1:])
+    except EnvironmentError, e:
+        if e.errno == errno.ENOENT:
+            # Tried to chainload something that doesn't exist.
+            # Perhaps executing from a backup file?
+            orig_exe = get_original_filename(sys.executable)
+            if orig_exe is not None:
+                target_exe = target+dir + orig_executable[len(appdir):]
+                execv(target_exe,[target_exe] + sys.argv[1:])
 
 
-def get_best_version(appdir,include_partial_installs=False):
+def get_best_version(appdir,include_partial_installs=False,appname=None):
     """Get the best usable version directory from inside the given appdir.
 
     In the common case there is only a single version directory, but failed
@@ -160,10 +169,16 @@ def get_best_version(appdir,include_partial_installs=False):
     #  Find all potential version directories, sorted by version number.
     candidates = []
     for nm in listdir(appdir):
-        (_,ver,_) = split_app_version(nm)
-        if ver and is_version_dir(pathjoin(appdir,nm)):
-            ver = parse_version(ver)
-            candidates.append((ver,nm))
+        (appnm,ver,platform) = split_app_version(nm)
+        #  If its name didn't parse properly, don't bother looking inside.
+        if ver and platform:
+            #  If we're given a specific name, it must have that name
+            if appname is not None and appnm != appname:
+                continue
+            #  We have to pay another stat() call to check if it's active.
+            if is_version_dir(pathjoin(appdir,nm)):
+                ver = parse_version(ver)
+                candidates.append((ver,nm))
     candidates = [c[1] for c in sorted(candidates,reverse=True)]
     #  In the (hopefully) common case of no failed updates, we don't need
     #  to poke around in the filesystem so we just return asap.
@@ -191,10 +206,11 @@ def get_all_versions(appdir,include_partial_installs=False):
     #  Find all potential version directories, sorted by version number.
     candidates = []
     for nm in listdir(appdir):
-        (_,ver,_) = split_app_version(nm)
-        if ver and is_version_dir(pathjoin(appdir,nm)):
-            ver = parse_version(ver)
-            candidates.append((ver,nm))
+        (_,ver,platform) = split_app_version(nm)
+        if ver and platform:
+            if is_version_dir(pathjoin(appdir,nm)):
+                ver = parse_version(ver)
+                candidates.append((ver,nm))
     candidates = [c[1] for c in sorted(candidates,reverse=True)]
     #  Filter out any that are not completely installed.
     if not include_partial_installs:
@@ -222,6 +238,15 @@ def is_installed_version_dir(vdir):
     "esky-bootstrap" directory.
     """
     return not exists(pathjoin(vdir,"esky-bootstrap"))
+
+
+def is_uninstalled_version_dir(vdir):
+    """Check whether the given version directory is partially uninstalled.
+
+    A partially-uninstalled version dir has had its "esky-bootstrap.txt"
+    file renamed to "esky-bootstrap-old.txt".
+    """
+    return exists(pathjoin(vdir,"esky-bootstrap-old.txt"))
 
 
 def split_app_version(s):
@@ -313,4 +338,50 @@ def _split_version_components(s):
                 end += 1
         yield s[start:end]
         start = end
+
+
+def get_original_filename(backname):
+    """Given a backup filename, get the original name to which it refers.
+
+    This is only really possible if the original file actually exists and
+    is not guaranteed to be correct in all cases; but unless you do something
+    silly it should work out OK.
+
+    If no matching original file is found, None is returned.
+    """
+    filtered = ".".join(filter(lambda n: n != "old",backname.split(".")))
+    for nm in listdir(dirname(backname)):
+        if nm == backname:
+            continue
+        if filtered == ".".join(filter(lambda n: n != "old",nm.split("."))):
+            return pathjoin(dirname(backname),nm)
+    return None
+
+
+_locked_version_dirs = {}
+
+def lock_version_dir(vdir):
+    """Lock the given version dir so it cannot be uninstalled."""
+    if sys.platform == "win32":
+        #  On win32, we just hold bootstrap file open for reading.
+        #  This will prevent it from being renamed during uninstall.
+        lockfile = pathjoin(vdir,"esky-bootstrap.txt")
+        _locked_version_dirs.setdefault(vdir,[]).append(open(lockfile,"rt"))
+    else:
+        #  On posix platforms we take a shared flock on esky-lockfile.txt.
+        #  While fcntl.fcntl locks are apparently the new hotness, they have
+        #  unfortunate semantics that we don't want for this application:
+        #      * not inherited across fork()
+        #      * released when closing *any* fd associated with that file
+        #  fcntl.flock doesn't have these problems, but may fail on NFS.
+        #  To complicate matters, python sometimes emulated flock with fcntl!
+        #  We therefore use a separate lock file to avoid unpleasantness.
+        lockfile = pathjoin(vdir,"esky-lockfile.txt")
+        f = open(lockfile,"r")
+        _locked_version_dirs.setdefault(vdir,[]).append(f)
+        fcntl.flock(f,fcntl.LOCK_SH)
+
+def unlock_version_dir(vdir):
+    """Unlock the given version dir, allowing it to be uninstalled."""
+    _locked_version_dirs[vdir].pop().close()
 

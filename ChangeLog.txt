@@ -1,4 +1,75 @@
 
+v0.7.1:
+
+    * restored compatability with Python 3.
+    * fixed automatic detection of gui-only scripts based on filename.
+    * set variable "__esky_name__" in the bootstrapping code, and use it to
+      potentially speed up application startup.
+
+v0.7.0:
+
+    * Renamed "esky.helper" to "esky.sudo" along with much refactoring:
+        * @esky.use_helper_app is now @esky.allow_from_sudo() and is used to 
+          declare a type signature.
+        * Esky.helper_app is now Esky.sudo_proxy and is always an instance
+          of esky.sudo.SudoProxy.
+        * added Esky.drop_root() method to drop root privileges.
+        * implemented multiple safeguards against malicious input when running
+          with root privileges.
+    * Cause all scripts to automagically call esky.run_startup_hooks() on
+      startup.  Currently this:
+        * detects the --esky-spawn-sudo option and runs the sudo helper.
+        * detects the --esky-spawn-cleanup option and runs the cleanup helper.
+    * Have Esky.auto_update() call Esky.cleanup() automatically (mostly so it
+      can immediately drop any root privileges it has acquired).
+    * Use a separate file "esky-lockfile.txt" for version locking.  This
+      will help protect against strange behaviour when fcntl.flock is
+      simulated using fcntl.lockf (which released the lock when *any* handle
+      to the file is closed).
+    * Try to load correctly if executed from a temporary backup file
+      (e.g. running from "prog.old.exe" instead of "prog.exe").
+    * Allow direct overwriting of existing bootstrap files on win32 (instead
+      of renaming the old version out of the way) but only in very special
+      circumstances:
+        * currently only for executables where the icon or version info
+          has changed but the rest of the exe has not.
+        * may require spawning a new copy of the process at shutdown, to
+          overwrite any in-use bootstrap exes. Use Esky.cleanup_at_exit().
+    * Several improvements to py2exe support:
+        * implemented "optimize" and "unbuffered" settings in the custom
+          bootstrap code.
+        * more robust support for the various bundle_files options.
+
+v0.6.0:
+
+    * Added Esky.get_root() method, which can escalate to root privileges by
+      spawning a separate helper process.
+        * use Esky.has_root() to check if it already has root privileges.
+        * escalation can use a variety of "sudo" frontends on Unix, and
+          the "runas" functionality on win32 when UAC is enabled.
+        * Esky.auto_update() will escalate automatically if it encounters
+          a permission error.
+
+v0.5.3:
+
+    * DefaultVersionFinder: make search for update links case-insensitive.
+    * py2exe chainloader: execute scripts in the context of the __main__ module.
+    * reduce number of stat() calls during bootstrap process.
+    * better cleanup of "*.old.*" files from the bootstrap env.
+    * use fcntl.flock() for version locking; it's slightly less portable but
+      has much better semantics for what we want.
+
+v0.5.2:
+
+    * more robust error-handling in esky.bootstrap.exists()
+
+
+v0.5.1:
+
+    * only delete files from the top-level app dir if they explicitly belong
+      to a version that is being removed.
+
+
 v0.5.0:
 
     * implemented preliminary support for freezing with py2app.

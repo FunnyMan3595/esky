@@ -1,4 +1,4 @@
-#  Copyright (c) 2009, Cloud Matrix Pty. Ltd.
+#  Copyright (c) 2009-2010, Cloud Matrix Pty. Ltd.
 #  All rights reserved; available under the terms of the BSD License.
 """
 
@@ -13,6 +13,7 @@ import sys
 import imp
 import time
 import zipfile
+import tempfile
 import marshal
 import struct
 import shutil
@@ -42,15 +43,19 @@ def freeze(dist):
     for (nm,val) in options.iteritems():
         setattr(f,nm,val)
     f.addModule("esky")
-    for exe in dist.get_executables():
-        f.addScript(exe.script,gui_only=exe.gui_only)
-    if "include_py" not in options:
-        f.include_py = False
-    if "linkmethod" not in options:
-        #  Since we're going to zip it up, the benefits of hard- or sym-linking
-        #  the loader exe will mostly be lost.
-        f.linkmethod = "loader"
-    f()
+    tdir = tempfile.mkdtemp()
+    try:
+        for exe in dist.get_executables():
+            f.addScript(exe.script,gui_only=exe.gui_only)
+        if "include_py" not in options:
+            f.include_py = False
+        if "linkmethod" not in options:
+            #  Since we're going to zip it up, the benefits of hard-
+            #  or sym-linking the loader exe will mostly be lost.
+            f.linkmethod = "loader"
+        f()
+    finally:
+        shutil.rmtree(tdir)
     #  Copy data files into the freeze dir
     for (src,dst) in dist.get_data_files():
         dst = os.path.join(dist.freeze_dir,dst)
@@ -67,6 +72,7 @@ def freeze(dist):
     code_source = [inspect.getsource(esky.bootstrap)]
     if sys.platform == "win32":
         code_source.append(_CUSTOM_WIN32_CHAINLOADER)
+    code_source.append("__esky_name__ = '%s'" % (dist.distribution.get_name(),))
     if dist.bootstrap_module is None:
         code_source.append("bootstrap()")
     else:
@@ -107,7 +113,9 @@ def freeze(dist):
     #  Copy the loader program for each script.
     #  We explicitly strip the loader binaries, in case they were made
     #  by linking to the library.zip.
-    for exe in dist.get_executables():
+    for exe in dist.get_executables(rewrite=False):
+        if not exe.include_in_bootstrap_env:
+            continue
         exepath = dist.copy_to_bootstrap_env(exe.name)
         f.stripBinary(exepath)
 
@@ -137,7 +145,15 @@ def _chainload(target_dir):
       else:
           sys.modules.pop("esky",None)
           sys.modules.pop("esky.bootstrap",None)
-          exec code in {"__name__":"__main__"}
+          try:
+              exec code in {"__name__":"__main__"}
+          except zipimport.ZipImportError, e:
+              #  If it can't find the __main__{sys.executable} script,
+              #  the user might be running from a backup exe file.
+              #  Fall back to original chainloader to attempt workaround.
+              if e.message.startswith("can't find module '__main__"):
+                  _orig_chainload(target_dir)
+              raise
           sys.exit(0)
 """
 

@@ -1,3 +1,5 @@
+#  Copyright (c) 2009-2010, Cloud Matrix Pty. Ltd.
+#  All rights reserved; available under the terms of the BSD License.
 
 from __future__ import with_statement
 
@@ -14,6 +16,7 @@ import urllib2
 import hashlib
 import tarfile
 import time
+from contextlib import contextmanager
 from SimpleHTTPServer import SimpleHTTPRequestHandler
 from BaseHTTPServer import HTTPServer
 
@@ -22,9 +25,10 @@ from distutils import dir_util
 
 import esky
 import esky.patch
+import esky.sudo
 from esky import bdist_esky
 from esky.util import extract_zipfile, get_platform
-from esky.fstransact import FSTransaction
+from esky.fstransact import FSTransaction, files_differ
 
 try:
     import py2exe
@@ -56,27 +60,66 @@ if not hasattr(HTTPServer,"shutdown"):
     HTTPServer.shutdown = socketserver_shutdown
 
 
+@contextmanager
+def setenv(key,value):
+    oldval = os.environ.get(key,None)
+    os.environ[key] = value
+    yield
+    if oldval is not None:
+        os.environ[key] = oldval
+    else:
+        del os.environ[key]
+
+
 class TestEsky(unittest.TestCase):
 
   if py2exe is not None:
     def test_esky_py2exe(self):
-        """Build and launch a self-testing esky application using py2exe."""
         self._run_eskytester({"bdist_esky":{"freezer_module":"py2exe"}})
+    def test_esky_py2exe_bundle1(self):
+        self._run_eskytester({"bdist_esky":{"freezer_module":"py2exe",
+                                            "freezer_options": {
+                                              "bundle_files": 1
+                                            }}})
+    def test_esky_py2exe_bundle2(self):
+        self._run_eskytester({"bdist_esky":{"freezer_module":"py2exe",
+                                            "freezer_options": {
+                                              "bundle_files": 2
+                                            }}})
+    def test_esky_py2exe_bundle3(self):
+        self._run_eskytester({"bdist_esky":{"freezer_module":"py2exe",
+                                            "freezer_options": {
+                                              "bundle_files": 3
+                                            }}})
+    if esky.sudo.can_get_root():
+        def test_esky_py2exe_needsroot(self):
+            with setenv("ESKY_NEEDSROOT","1"):
+               self._run_eskytester({"bdist_esky":{"freezer_module":"py2exe"}})
 
   if py2app is not None:
     def test_esky_py2app(self):
-        """Build and launch a self-testing esky application using py2app."""
         self._run_eskytester({"bdist_esky":{"freezer_module":"py2app"}})
+    if esky.sudo.can_get_root():
+        def test_esky_py2app_needsroot(self):
+            with setenv("ESKY_NEEDSROOT","1"):
+                self._run_eskytester({"bdist_esky":{"freezer_module":"py2app"}})
 
   if bbfreeze is not None:
     def test_esky_bbfreeze(self):
-        """Build and launch a self-testing esky application using bbfreeze."""
         self._run_eskytester({"bdist_esky":{"freezer_module":"bbfreeze"}})
+    if esky.sudo.can_get_root():
+        def test_esky_bbfreeze_needsroot(self):
+            with setenv("ESKY_NEEDSROOT","1"):
+                self._run_eskytester({"bdist_esky":{"freezer_module":"bbfreeze"}})
 
   if cx_Freeze is not None:
     def test_esky_cxfreeze(self):
-        """Build and launch a self-testing esky application using cx_Freeze."""
         self._run_eskytester({"bdist_esky":{"freezer_module":"cxfreeze"}})
+    if esky.sudo.can_get_root():
+        def test_esky_cxfreeze_needsroot(self):
+            with setenv("ESKY_NEEDSROOT","1"):
+                self._run_eskytester({"bdist_esky":{"freezer_module":"cxfreeze"}})
+
 
   def _run_eskytester(self,options):
     """Build and run the eskytester app using the given distutils options.
@@ -85,20 +128,19 @@ class TestEsky(unittest.TestCase):
     sequence of tests performed range across "script1.py" to "script3.py".
     """
     olddir = os.path.abspath(os.curdir)
+    tdir = tempfile.mkdtemp()
     server = None
     try:
+        options.setdefault("build",{})["build_base"] = os.path.join(tdir,"build")
+        options.setdefault("bdist",{})["dist_dir"] = os.path.join(tdir,"dist")
         platform = get_platform()
         deploydir = "deploy.%s" % (platform,)
         esky_root = dirname(dirname(dirname(__file__)))
-        os.chdir(os.path.join(esky_root,"esky","tests"))
+        os.chdir(tdir)
+        shutil.copytree(os.path.join(esky_root,"esky","tests","eskytester"),"eskytester")
         #  Clean up after previous test runs.
         if os.path.isdir(deploydir):
             shutil.rmtree(deploydir)
-        for version in ("0.1","0.2","0.3"):
-            build_dir = os.path.join("dist","eskytester-%s.%s")
-            build_dir = build_dir % (version,platform,)
-            if os.path.isdir(build_dir):
-                shutil.rmtree(build_dir)
         dir_util._path_created.clear()
         #  Build three increasing versions of the test package.
         #  Version 0.2 will include a bundled MSVCRT on win32.
@@ -113,7 +155,17 @@ class TestEsky(unittest.TestCase):
         dist_setup(version="0.1",scripts=["eskytester/script1.py"],options=options,script_args=["bdist_esky"],**metadata)
         dist_setup(version="0.2",scripts=["eskytester/script1.py","eskytester/script2.py"],options=options2,script_args=["bdist_esky"],**metadata)
         dist_setup(version="0.3",scripts=["eskytester/script2.py","eskytester/script3.py"],options=options,script_args=["bdist_esky_patch"],**metadata)
-        os.unlink(os.path.join("dist","eskytester-0.3.%s.zip"%(platform,)))
+        os.unlink(os.path.join(tdir,"dist","eskytester-0.3.%s.zip"%(platform,)))
+        #  Check that the patches apply cleanly
+        uzdir = os.path.join(tdir,"unzip")
+        extract_zipfile(os.path.join(tdir,"dist","eskytester-0.1.%s.zip"%(platform,)),uzdir)
+        with open(os.path.join(tdir,"dist","eskytester-0.3.%s.from-0.1.patch"%(platform,)),"rb") as f:
+            esky.patch.apply_patch(uzdir,f)
+        shutil.rmtree(uzdir)
+        extract_zipfile(os.path.join(tdir,"dist","eskytester-0.2.%s.zip"%(platform,)),uzdir)
+        with open(os.path.join(tdir,"dist","eskytester-0.3.%s.from-0.2.patch"%(platform,)),"rb") as f:
+            esky.patch.apply_patch(uzdir,f)
+        shutil.rmtree(uzdir)
         #  Serve the updates at http://localhost:8000/dist/
         print "running local update server"
         server = HTTPServer(("localhost",8000),SimpleHTTPRequestHandler)
@@ -121,34 +173,54 @@ class TestEsky(unittest.TestCase):
         server_thread.daemon = True
         server_thread.start()
         #  Set up the deployed esky environment for the initial version
-        zfname = os.path.join("dist","eskytester-0.1.%s.zip"%(platform,))
+        zfname = os.path.join(tdir,"dist","eskytester-0.1.%s.zip"%(platform,))
         os.mkdir(deploydir)
         extract_zipfile(zfname,deploydir)
-        #  Run the first script, which will perform the necessary tests,
-        #  launch script2 and script3, and write the file "tests-completed".
+        #  Run the scripts in order.
         if options["bdist_esky"]["freezer_module"] == "py2app":
-            tests_completed = os.path.join(deploydir,"eskytester-0.3."+platform,"Contents/Resources/tests-completed")
+            cmd1 = os.path.join(deploydir,"Contents","MacOS","script1")
+            cmd2 = os.path.join(deploydir,"Contents","MacOS","script2")
+            cmd3 = os.path.join(deploydir,"Contents","MacOS","script3")
         else:
-            tests_completed = "tests-completed"
-        if os.path.exists(tests_completed):
-            os.unlink(tests_completed)
-        if os.path.exists("tests-completed"):
-            os.unlink("tests-completed")
-        if options["bdist_esky"]["freezer_module"] == "py2app":
-            cmd = os.path.join(deploydir,"Contents","MacOS","script1")
-        elif sys.platform == "win32":
-            cmd = os.path.join(deploydir,"script1.exe")
-        else:
-            cmd = os.path.join(deploydir,"script1")
-        print "spawning eskytester application"
-        p = subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+            if sys.platform == "win32":
+                cmd1 = os.path.join(deploydir,"script1.exe")
+                cmd2 = os.path.join(deploydir,"script2.exe")
+                cmd3 = os.path.join(deploydir,"script3.exe")
+            else:
+                cmd1 = os.path.join(deploydir,"script1")
+                cmd2 = os.path.join(deploydir,"script2")
+                cmd3 = os.path.join(deploydir,"script3")
+        print "spawning eskytester script1", options["bdist_esky"]["freezer_module"]
+        p = subprocess.Popen(cmd1)#,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+        #(stdout,_) = p.communicate()
+        #sys.stdout.write(stdout.decode())
+        p.wait()
+        assert p.returncode == 0
+        assert os.path.exists("tests-completed")
+        os.unlink("tests-completed")
+        print "spawning eskytester script2"
+        p = subprocess.Popen(cmd2,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
         (stdout,_) = p.communicate()
         sys.stdout.write(stdout.decode())
         assert p.returncode == 0
-        assert os.path.exists(tests_completed)
-        os.unlink(tests_completed)
+        assert os.path.exists("tests-completed")
+        os.unlink("tests-completed")
+        print "spawning eskytester script3"
+        p = subprocess.Popen(cmd3,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+        (stdout,_) = p.communicate()
+        sys.stdout.write(stdout.decode())
+        assert p.returncode == 0
+        assert os.path.exists("tests-completed")
+        os.unlink("tests-completed")
     finally:
         os.chdir(olddir)
+        for i in xrange(10):
+            try:
+                shutil.rmtree(tdir)
+            except EnvironmentError:
+                time.sleep(2)
+            else:
+                break
         if server:
             server.shutdown()
  
@@ -479,6 +551,28 @@ class TestPatch(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.workdir)
 
+    def test_patch_bigfile(self):
+        tdir = tempfile.mkdtemp()
+        try:
+            data = [os.urandom(100)*10 for i in xrange(6)]
+            for nm in ("source","target"):
+                with open(os.path.join(tdir,nm),"wb") as f:
+                    for i in xrange(1000):
+                        for chunk in data:
+                            f.write(chunk)
+                data[2],data[3] = data[3],data[2]
+            with open(os.path.join(tdir,"patch"),"wb") as f:
+                esky.patch.write_patch(os.path.join(tdir,"source"),os.path.join(tdir,"target"),f)
+            dgst1 = esky.patch.calculate_digest(os.path.join(tdir,"target"))
+            dgst2 = esky.patch.calculate_digest(os.path.join(tdir,"source"))
+            self.assertNotEquals(dgst1,dgst2)
+            with open(os.path.join(tdir,"patch"),"rb") as f:
+                esky.patch.apply_patch(os.path.join(tdir,"source"),f)
+            dgst3 = esky.patch.calculate_digest(os.path.join(tdir,"source"))
+            self.assertEquals(dgst1,dgst3)
+        finally:
+            shutil.rmtree(tdir)
+
     def test_diffing_back_and_forth(self):
         for (tf1,_) in self._TEST_FILES:
             for (tf2,_) in self._TEST_FILES:
@@ -501,7 +595,7 @@ class TestPatch(unittest.TestCase):
         path2 = os.path.join(path2,"pyenchant-1.6.0")
         pf = os.path.join(self.tfdir,"v1.2.0_to_v1.6.0.patch")
         if not os.path.exists(pf):
-            pf = os.path.join(self.tfdir,"../../../../../esky/tests/patch-test-files/v1.2.0_to_v1.6.0.patch")
+            pf = os.path.join(dirname(esky.__file__),"tests","patch-test-files","v1.2.0_to_v1.6.0.patch")
         with open(pf,"rb") as f:
             esky.patch.apply_patch(path1,f)
         self.assertEquals(esky.patch.calculate_digest(path1),
@@ -510,8 +604,14 @@ class TestPatch(unittest.TestCase):
 
     def _extract(self,filename,dest):
         dest = os.path.join(self.workdir,dest)
-        if os.path.exists(dest):
-            shutil.rmtree(dest)
+        for i in xrange(10):
+            if os.path.exists(dest):
+                try:
+                    shutil.rmtree(dest)
+                except EnvironmentError:
+                    time.sleep(1)
+                else:
+                    break
         f = tarfile.open(os.path.join(self.tfdir,filename),"r:gz")
         try:
             f.extractall(dest)
@@ -520,4 +620,29 @@ class TestPatch(unittest.TestCase):
         return dest
         
 
+class TestFilesDiffer(unittest.TestCase):
+
+    def setUp(self):
+        self.tdir = tempfile.mkdtemp()
+
+    def _path(self,*names):
+        return os.path.join(self.tdir,*names)
+
+    def _differs(self,data1,data2,start=0,stop=None):
+        with open(self._path("file1"),"wb") as f:
+            f.write(data1.encode("ascii"))
+        with open(self._path("file2"),"wb") as f:
+            f.write(data2.encode("ascii"))
+        return files_differ(self._path("file1"),self._path("file2"),start,stop)
+
+    def test_files_differ(self):
+        assert self._differs("one","two")
+        assert self._differs("onethreetwo","twothreeone")
+        assert self._differs("onethreetwo","twothreeone",3)
+        assert not self._differs("onethreetwo","twothreeone",3,-3)
+        assert self._differs("onethreetwo","twothreeone",2,-3)
+        assert self._differs("onethreetwo","twothreeone",3,-2)
+
+    def tearDown(self):
+        shutil.rmtree(self.tdir)
 

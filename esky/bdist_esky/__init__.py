@@ -1,4 +1,4 @@
-#  Copyright (c) 2009, Cloud Matrix Pty. Ltd.
+#  Copyright (c) 2009-2010, Cloud Matrix Pty. Ltd.
 #  All rights reserved; available under the terms of the BSD License.
 """
 
@@ -21,6 +21,7 @@ import re
 import sys
 import shutil
 import zipfile
+import tempfile
 from glob import glob
 
 import distutils.command
@@ -86,21 +87,27 @@ class Executable(str):
     def __new__(cls,script,**kwds):
         return str.__new__(cls,script)
 
-    def __init__(self,script,icon=None,gui_only=None,**kwds):
+    def __init__(self,script,name=None,icon=None,gui_only=None,
+                      include_in_bootstrap_env=True,**kwds):
         str.__init__(script)
         self.script = script
+        self.include_in_bootstrap_env = include_in_bootstrap_env
         self.icon = icon
+        self._name = name
         self._gui_only = gui_only
         self._kwds = kwds
 
     @property
     def name(self):
-        nm = os.path.basename(self.script)
-        if nm.endswith(".py"):
-            nm = nm[:-3]
-        elif nm.endswith(".pyw"):
-            nm = nm[:-4]
-        if sys.platform == "win32":
+        if self._name is not None:
+            nm = self._name
+        else:
+            nm = os.path.basename(self.script)
+            if nm.endswith(".py"):
+                nm = nm[:-3]
+            elif nm.endswith(".pyw"):
+                nm = nm[:-4]
+        if sys.platform == "win32" and not nm.endswith(".exe"):
             nm += ".exe"
         return nm
 
@@ -143,6 +150,9 @@ class bdist_esky(Command):
         bootstrap_module:  a custom module to use for esky bootstrapping;
                            the default calls esky.bootstrap.common.bootstrap()
 
+        dont_run_startup_hooks:  don't force all executables to call
+                                 esky.run_startup_hooks() on startup.
+
         bundle_msvcrt:  whether to bundle the MSVCRT DLLs, manifest files etc
                         as a private assembly.  The default is False; only
                         those with a valid license to redistriute these files
@@ -167,9 +177,11 @@ class bdist_esky(Command):
                      "list of modules to specifically include"),
                     ('excludes=', None,
                      "list of modules to specifically exclude"),
+                    ('dont-run-startup-hooks=', None,
+                     "don't force execution of esky.run_startup_hooks()"),
                    ]
 
-    boolean_options = ["bundle-msvcrt"]
+    boolean_options = ["bundle-msvcrt","dont-run-startup-hooks"]
 
     def initialize_options(self):
         self.dist_dir = None
@@ -178,6 +190,7 @@ class bdist_esky(Command):
         self.freezer_module = None
         self.freezer_options = {}
         self.bundle_msvcrt = False
+        self.dont_run_startup_hooks = False
         self.bootstrap_module = None
 
     def finalize_options(self):
@@ -207,6 +220,13 @@ class bdist_esky(Command):
 
 
     def run(self):
+        self.tempdir = tempfile.mkdtemp()
+        try:
+            self._run()
+        finally:
+            shutil.rmtree(self.tempdir)
+
+    def _run(self):
         #  Create the dirs into which to freeze the app
         fullname = self.distribution.get_fullname()
         platform = get_platform()
@@ -219,20 +239,60 @@ class bdist_esky(Command):
         os.makedirs(self.freeze_dir)
         #  Hand things off to the selected freezer module
         self.freezer_module.freeze(self)
+        #  Create the necessary control files
+        if platform != "win32":
+            open(os.path.join(self.freeze_dir,"esky-lockfile.txt"),"w").close()
         #  Zip up the distribution
         print "zipping up the esky"
         zfname = os.path.join(self.dist_dir,"%s.%s.zip"%(fullname,platform,))
         create_zipfile(self.bootstrap_dir,zfname,compress=True)
         shutil.rmtree(self.bootstrap_dir)
+        
 
-    def get_executables(self):
-        """Yield an Executable instance for each script to be frozen."""
+    def get_executables(self,rewrite=True):
+        """Yield an Executable instance for each script to be frozen.
+
+        If "rewrite" is True (the default) then the user-provided scripts
+        will be rewritten to include the esky startup code.  If the freezer
+        has a better way of doing that, it should pass rewrite=False.
+        """
+        if rewrite and not os.path.exists(os.path.join(self.tempdir,"scripts")):
+            os.mkdir(os.path.join(self.tempdir,"scripts"))
         if self.distribution.has_scripts():
             for s in self.distribution.scripts:
                 if isinstance(s,Executable):
-                    yield s
+                    exe = s
                 else:
-                    yield Executable(s)
+                    exe = Executable(s)
+                if rewrite:
+                    name = exe.name
+                    if sys.platform == "win32" and name.endswith(".exe"):
+                        name = name[:-4]
+                    if "." in exe.script:
+                        ext = "." + exe.script.split(".")[-1]
+                    else:
+                        ext = ""
+                    script = os.path.join(self.tempdir,"scripts",name+ext)
+                    with open(exe.script,"rt") as fIn:
+                        with open(script,"wt") as fOut:
+                            for ln in fIn:
+                                if ln.strip():
+                                    if not ln.strip().startswith("#"):
+                                        if "__future__" not in ln:
+                                            break
+                                fOut.write(ln)
+                            if not self.dont_run_startup_hooks:
+                                fOut.write("import esky\n")
+                                fOut.write("esky.run_startup_hooks()\n")
+                                fOut.write("\n")
+                            fOut.write(ln)
+                            for ln in fIn:
+                                fOut.write(ln)
+                    new_exe = Executable(script)
+                    new_exe.__dict__.update(exe.__dict__)
+                    new_exe.script = script
+                    exe = new_exe
+                yield exe
 
     def get_data_files(self):
         """Yield (source,destination) tuples for data files.
@@ -319,8 +379,9 @@ class bdist_esky(Command):
         the latest C runtime installed *and* you don't want to run the special
         "vcredist_x86.exe" program during your installation process.
 
-        Bundling is only perform on win32 paltforms, and only if you explicitly         enable it.  Before doing so, carefully check whether you have a license
-        to distribute these files.
+        Bundling is only performed on win32 paltforms, and only if you enable
+        it explicitly.  Before doing so, carefully check whether you have a
+        license to distribute these files.
         """
         msvcrt_info = self._get_msvcrt_info()
         if msvcrt_info is not None:
@@ -381,21 +442,24 @@ class bdist_esky(Command):
         #  Search for redist files in a Visual Studio install
         progfiles = os.path.expandvars("%PROGRAMFILES%")
         for dnm in os.listdir(progfiles):
-            if dnm.startswith("Microsoft Visual Studio"):
+            if dnm.lower().startswith("microsoft visual studio"):
                 dpath = os.path.join(progfiles,dnm,"VC","redist")
                 for (subdir,_,filenames) in os.walk(dpath):
                     for fnm in filenames:
-                        if name in fnm and fnm.endswith(".manifest"):
-                            yield os.path.join(subdir,fnm)
+                        if name.lower() in fnm.lower():
+                            if fnm.lower().endswith(".manifest"):
+                                yield os.path.join(subdir,fnm)
         #  Search for manifests installed in the WinSxS directory
         winsxs_m = os.path.expandvars("%WINDIR%\\WinSxS\\Manifests")
         for fnm in os.listdir(winsxs_m):
-            if name in fnm and fnm.endswith(".manifest"):
-                yield os.path.join(winsxs_m,fnm)
+            if name.lower() in fnm.lower():
+                if fnm.lower().endswith(".manifest"):
+                    yield os.path.join(winsxs_m,fnm)
         winsxs = os.path.expandvars("%WINDIR%\\WinSxS")
         for fnm in os.listdir(winsxs):
-            if name in fnm and fnm.endswith(".manifest"):
-                yield os.path.join(winsxs,fnm)
+            if name.lower() in fnm.lower():
+                if fnm.lower().endswith(".manifest"):
+                    yield os.path.join(winsxs,fnm)
 
     def copy_to_bootstrap_env(self,src,dst=None):
         """Copy the named file into the bootstrap environment.
@@ -413,11 +477,18 @@ class bdist_esky(Command):
                self.mkpath(os.path.dirname(dstpath))
             self.copy_file(srcpath,dstpath)
         f_manifest = os.path.join(self.freeze_dir,"esky-bootstrap.txt")
-        f_manifest = open(f_manifest,"at")
-        f_manifest.seek(0,os.SEEK_END)
-        f_manifest.write(dst)
-        f_manifest.write("\n")
-        f_manifest.close()
+        with open(f_manifest,"at") as f_manifest:
+            f_manifest.seek(0,os.SEEK_END)
+            if os.path.isdir(srcpath):
+                for (dirnm,_,filenms) in os.walk(srcpath):
+                    for fnm in filenms:
+                        fpath = os.path.join(dirnm,fnm)
+                        dpath = dst + fpath[len(srcpath):]
+                        f_manifest.write(dpath)
+                        f_manifest.write("\n")
+            else:
+                f_manifest.write(dst)
+                f_manifest.write("\n")
         return dstpath
 
 
@@ -448,7 +519,7 @@ class bdist_esky_patch(Command):
         platform = get_platform()
         vdir = "%s.%s" % (fullname,platform,)
         appname = split_app_version(vdir)[0]
-        #  Ensure we have current versions esky, as target for patch.
+        #  Ensure we have current version's esky, as target for patch.
         target_esky = os.path.join(self.dist_dir,vdir+".zip")
         if not os.path.exists(target_esky):
             self.run_command("bdist_esky")
