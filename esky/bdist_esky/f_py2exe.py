@@ -94,6 +94,7 @@ def freeze(dist):
         includes.append(inc)
     for exc in options.pop("excludes",()):
         excludes.append(exc)
+    bundle_bootstrap_pydll = options.pop("bundle_bootstrap_pydll", True)
     #  py2exe expects some arguments on the main distribution object.
     #  We handle data_files ourselves, so fake it out for py2exe.
     dist.distribution.console = []
@@ -181,7 +182,10 @@ def freeze(dist):
     #  bootstrap env small and minimises the chances of something going wrong.
     pydll = u"python%d%d.dll" % sys.version_info[:2]
     frozen_pydll = os.path.join(dist.freeze_dir,pydll)
-    if os.path.exists(frozen_pydll):
+    if not bundle_bootstrap_pydll:
+        # User requestd we not do this.
+        pydll_bytes = None
+    elif os.path.exists(frozen_pydll):
         for nm in os.listdir(dist.freeze_dir):
             if nm == pydll:
                 continue
