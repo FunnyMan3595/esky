@@ -22,6 +22,7 @@ import sys
 import shutil
 import zipfile
 import tempfile
+import inspect
 from glob import glob
 
 import distutils.command
@@ -72,24 +73,37 @@ except ImportError:
     _FREEZERS["cx_freeze"] = None
 
 
-class Executable(str):
+class Executable(unicode):
     """Class to hold information about a specific executable.
 
     This class provides a uniform way to specify extra meta-data about
     a frozen executable.  By setting various keyword arguments, you can
     specify e.g. the icon, and whether it is a gui-only script.
 
-    This is a subclass of str() so that it can appear directly in the
-    "scripts" argument of the setup() function; I know it's ugly, but
-    it works.
+    Some freezer modules require all items in the "scripts" argument to
+    be strings naming real files.  This is therefore a subclass of unicode,
+    and if it refers only to in-memory code then its string value will be
+    the path to this very file.  I know it's ugly, but it works.
     """
 
     def __new__(cls,script,**kwds):
-        return str.__new__(cls,script)
+        if isinstance(script,basestring):
+            return unicode.__new__(cls,script)
+        else:
+            return unicode.__new__(cls,__file__)
 
     def __init__(self,script,name=None,icon=None,gui_only=None,
                       include_in_bootstrap_env=True,**kwds):
-        str.__init__(script)
+        unicode.__init__(self)
+        if isinstance(script,Executable):
+            script = script.script
+            if name is None:
+                name = script.name
+            if gui_only is None:
+                gui_only = script.gui_only
+        if not isinstance(script,basestring):
+            if name is None:
+                raise TypeError("Must specify name if script is not a file")
         self.script = script
         self.include_in_bootstrap_env = include_in_bootstrap_env
         self.icon = icon
@@ -102,6 +116,8 @@ class Executable(str):
         if self._name is not None:
             nm = self._name
         else:
+            if not isinstance(self.script,basestring):
+                raise TypeError("Must specify name if script is not a file")
             nm = os.path.basename(self.script)
             if nm.endswith(".py"):
                 nm = nm[:-3]
@@ -114,7 +130,10 @@ class Executable(str):
     @property
     def gui_only(self):
         if self._gui_only is None:
-            return self.script.endswith(".pyw")
+            if not isinstance(self.script,basestring):
+                return False
+            else:
+                return self.script.endswith(".pyw")
         else:
             return self._gui_only
 
@@ -152,6 +171,8 @@ class bdist_esky(Command):
 
         bootstrap_code:  a custom code string to use for esky bootstrapping;
                          this precludes the use of the bootstrap_module option.
+                         If a non-string object is given, its source is taken
+                         using inspect.getsource().
 
         dont_run_startup_hooks:  don't force all executables to call
                                  esky.run_startup_hooks() on startup.
@@ -194,6 +215,10 @@ class bdist_esky(Command):
                      "list of modules to specifically exclude"),
                     ('dont-run-startup-hooks=', None,
                      "don't force execution of esky.run_startup_hooks()"),
+                    ('pre-freeze-callback=', None,
+                     "function to call just before starting to freeze the app"),
+                    ('pre-zip-callback=', None,
+                     "function to call just before starting to zip up the app"),
                    ]
 
     boolean_options = ["bundle-msvcrt","dont-run-startup-hooks"]
@@ -270,6 +295,8 @@ class bdist_esky(Command):
         platform = get_platform()
         self.bootstrap_dir = os.path.join(self.dist_dir,
                                           "%s.%s"%(fullname,platform,))
+        #self.freeze_dir = os.path.join(self.bootstrap_dir,"versions",
+        #                               "%s.%s"%(fullname,platform,))
         self.freeze_dir = os.path.join(self.bootstrap_dir,
                                        "%s.%s"%(fullname,platform,))
         if os.path.exists(self.bootstrap_dir):
@@ -302,45 +329,98 @@ class bdist_esky(Command):
             create_zipfile(self.bootstrap_dir,zfname,compress=True)
         shutil.rmtree(self.bootstrap_dir)
 
-    def get_executables(self,rewrite=True):
-        """Yield an Executable instance for each script to be frozen.
+    def _obj2code(self,obj):
+        """Convert an object to some python source code.
 
-        If "rewrite" is True (the default) then the user-provided scripts
-        will be rewritten to include the esky startup code.  If the freezer
-        has a better way of doing that, it should pass rewrite=False.
+        Iterables are flattened, None is elided, strings are included verbatim,
+        open files are read and anything else is passed to inspect.getsource().
         """
-        if rewrite and not os.path.exists(os.path.join(self.tempdir,"scripts")):
-            os.mkdir(os.path.join(self.tempdir,"scripts"))
+        if obj is None:
+            return ""
+        if isinstance(obj,basestring):
+            return obj
+        if hasattr(obj,"read"):
+            return obj.read()
+        try:
+            return "\n\n\n".join(self._obj2code(i) for i in obj)
+        except TypeError:
+            return inspect.getsource(obj)
+
+    def get_bootstrap_code(self):
+        """Get any extra code to be executed by the bootstrapping exe.
+
+        This method interprets the bootstrap-code and bootstrap-module settings
+        to construct any extra bootstrapping code that must be executed by
+        the frozen bootstrap executable.  It is returned as a string.
+        """
+        bscode = self.bootstrap_code
+        if bscode is None:
+            if self.bootstrap_module is not None:
+                bscode = __import__(self.bootstrap_module)
+                for submod in self.bootstrap_module.split(".")[1:]:
+                    bscode = getattr(bscode,submod)
+        bscode = self._obj2code(bscode)
+        return bscode
+
+    def get_executables(self,normalise=True):
+        """Yield a normalised Executable instance for each script to be frozen.
+
+        If "normalise" is True (the default) then the user-provided scripts
+        will be rewritten to decode any non-filename items specified as part
+        of the script, and to include the esky startup code.  If the freezer
+        has a better way of doing these things, it should pass normalise=False.
+        """
+        if normalise:
+            if not os.path.exists(os.path.join(self.tempdir,"scripts")):
+                os.mkdir(os.path.join(self.tempdir,"scripts"))
         if self.distribution.has_scripts():
             for s in self.distribution.scripts:
                 if isinstance(s,Executable):
                     exe = s
                 else:
                     exe = Executable(s)
-                if rewrite:
+                if normalise:
+                    #  Give the normalised script file a name matching that
+                    #  specified, since some freezers only take the filename.
                     name = exe.name
                     if sys.platform == "win32" and name.endswith(".exe"):
                         name = name[:-4]
-                    if "." in exe.script:
-                        ext = "." + exe.script.split(".")[-1]
+                    if exe.endswith(".pyw"):
+                        ext = ".pyw"
                     else:
-                        ext = ""
+                        ext = ".py"
                     script = os.path.join(self.tempdir,"scripts",name+ext)
-                    with open(exe.script,"rt") as fIn:
-                        with open(script,"wt") as fOut:
-                            for ln in fIn:
-                                if ln.strip():
-                                    if not ln.strip().startswith("#"):
-                                        if "__future__" not in ln:
-                                            break
-                                fOut.write(ln)
-                            if not self.dont_run_startup_hooks:
-                                fOut.write("import esky\n")
-                                fOut.write("esky.run_startup_hooks()\n")
-                                fOut.write("\n")
+                    #  Get the code for the target script.
+                    #  If it's a single string then interpret it as a filename,
+                    #  otherwise feed it into the _obj2code logic.
+                    if isinstance(exe.script,basestring):
+                        with open(exe.script,"rt") as f:
+                            code = f.read()
+                    else:
+                        code = self._obj2code(exe.script)
+                    #  Check that the code actually compiles - sometimes it
+                    #  can be hard to get a good message out of the freezer.
+                    compile(code,"","exec")
+                    #  Augment the given code with special esky-related logic.
+                    with open(script,"wt") as fOut:
+                        lines = (ln+"\n" for ln in code.split("\n"))
+                        #  Keep any leading comments and __future__ imports
+                        #  at the start of the file.
+                        for ln in lines:
+                            if ln.strip():
+                                if not ln.strip().startswith("#"):
+                                    if "__future__" not in ln:
+                                        break
                             fOut.write(ln)
-                            for ln in fIn:
-                                fOut.write(ln)
+                        #  Run the startup hooks before any actual code.
+                        if not self.dont_run_startup_hooks:
+                            fOut.write("import esky\n")
+                            fOut.write("esky.run_startup_hooks()\n")
+                            fOut.write("\n")
+                        #  Then just include the rest of the script code.
+                        fOut.write(ln)
+                        for ln in lines:
+                            fOut.write(ln)
                     new_exe = Executable(script)
                     new_exe.__dict__.update(exe.__dict__)
                     new_exe.script = script

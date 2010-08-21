@@ -33,51 +33,52 @@ from __future__ import absolute_import
 
 import sys
 
-from esky.util import LazyImport
+from esky.util import lazy_import
 
-class LazyImport(LazyImport):
-    _esky_lazy_namespace = globals()
+@lazy_import
+def functools():
+    import functools
+    return functools
 
-class functools(LazyImport):
-    def _esky_lazy_import():
-        import functools
-        return functools
-
-class pickle(LazyImport):
-    def _esky_lazy_import():
-        try:
-           import cPickle as pickle
-        except ImportError:
-            import pickle
-        return pickle
+@lazy_import
+def pickle():
+    try:
+       import cPickle as pickle
+    except ImportError:
+        import pickle
+    return pickle
 
 
 if sys.platform == "win32":
-    class _impl(LazyImport):
-        def _esky_lazy_import():
-            from esky.sudo import sudo_win32 as _impl
-            return _impl
+    @lazy_import
+    def _impl():
+        from esky.sudo import sudo_win32
+        return sudo_win32
 elif sys.platform == "darwin":
-    class _impl(LazyImport):
-        def _esky_lazy_import():
-            try:
-                from esky.sudo import sudo_osx  as _impl
-            except ImportError:
-                from esky.sudo import sudo_unix as _impl
-            return _impl
+    @lazy_import
+    def _impl():
+        try:
+            from esky.sudo import sudo_osx
+            return sudo_osx
+        except ImportError:
+            from esky.sudo import sudo_unix
+            return sudo_unix
 else:
-    class _impl(LazyImport):
-        def _esky_lazy_import():
-            from esky.sudo import sudo_unix as _impl
-            return _impl
+    @lazy_import
+    def _impl():
+        from esky.sudo import sudo_unix
+        return sudo_unix
 
 
 def spawn_sudo(proxy):
     return _impl.spawn_sudo(proxy)
+
 def has_root():
     return _impl.has_root()
+
 def can_get_root():
     return _impl.can_get_root()
+
 def run_startup_hooks():
     if len(sys.argv) > 1 and sys.argv[1] == "--esky-spawn-sudo":
         return _impl.run_startup_hooks()
@@ -95,7 +96,12 @@ class SudoProxy(object):
     """Object method proxy with root privileges."""
 
     def __init__(self,target):
-        self.name = target.name
+        #  Reflect the 'name' attribute if it has one, but don't worry
+        #  if not.  This helps SudoProxy be re-used on other clases.
+        try:
+            self.name = target.name
+        except AttributeError:
+            pass
         self.target = target
         self.closed = False
         self.pipe = None

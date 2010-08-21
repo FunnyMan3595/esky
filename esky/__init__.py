@@ -137,7 +137,7 @@ from __future__ import absolute_import
 
 __ver_major__ = 0
 __ver_minor__ = 8
-__ver_patch__ = 3
+__ver_patch__ = 5
 __ver_sub__ = ""
 __ver_tuple__ = (__ver_major__,__ver_minor__,__ver_patch__,__ver_sub__)
 __version__ = "%d.%d.%d%s" % __ver_tuple__
@@ -155,83 +155,71 @@ from esky.util import split_app_version, join_app_version,\
                       is_version_dir, is_uninstalled_version_dir,\
                       parse_version, get_best_version, appdir_from_executable,\
                       copy_ownership_info, lock_version_dir, ESKY_CONTROL_DIR,\
-                      files_differ, LazyImport
+                      files_differ, lazy_import
 
 #  Since all frozen apps are required to import this module and call the
 #  run_startup_hooks() function, we use a simple lazy import mechanism to
 #  make the initial import of this module as fast as possible.
 
-class LazyImport(LazyImport):
-    _esky_lazy_namespace = globals()
+@lazy_import
+def os():
+    import os
+    return os
 
-class os(LazyImport):
-    def _esky_lazy_import():
-        import os
-        return os
+@lazy_import
+def shutil():
+    import shutil
+    return shutil
 
-class shutil(LazyImport):
-    def _esky_lazy_import():
-        import shutil
-        return shutil
+@lazy_import
+def socket():
+    import socket
+    return socket
 
-class socket(LazyImport):
-    def _esky_lazy_import():
-        import socket
-        return socket
+@lazy_import
+def time():
+    import time
+    return time
 
-class time(LazyImport):
-    def _esky_lazy_import():
-        import time
-        return time
+@lazy_import
+def subprocess():
+    import subprocess
+    return subprocess
 
-class subprocess(LazyImport):
-    def _esky_lazy_import():
-        import subprocess
-        return subprocess
+@lazy_import
+def atexit():
+    import atexit
+    return atexit
 
-class atexit(LazyImport):
-    def _esky_lazy_import():
-        import atexit
-        return atexit
+@lazy_import
+def base64():
+    import base64
+    return base64
 
-class base64(LazyImport):
-    def _esky_lazy_import():
-        import base64
-        return base64
+@lazy_import
+def pickle():
+    try:
+        import cPickle as pickle
+    except ImportError:
+        import pickle
+    return pickle
 
-class pickle(LazyImport):
-    def _esky_lazy_import():
-        try:
-            import cPickle as pickle
-        except ImportError:
-            import pickle
-        return pickle
+@lazy_import
+def threading():
+    try:
+        import threading
+    except ImportError:
+        threading = None
+    return threading
 
-class threading(LazyImport):
-    def _esky_lazy_import():
-        try:
-            import threading
-        except ImportError:
-            threading = None
-        return threading
-
-class esky(LazyImport):
-    def _esky_lazy_import():
-        import esky
-        return esky
-    class finder(LazyImport):
-        def _esky_lazy_import():
-            import esky.finder
-            return esky.finder
-    class fstransact(LazyImport):
-        def _esky_lazy_import():
-            import esky.fstransact
-            return esky.fstransact
+@lazy_import
+def esky():
+    import esky
+    import esky.finder
+    import esky.fstransact
     if sys.platform == "win32":
-        class winres(LazyImport):
-            def _esky_lazy_import():
-                import esky.winres
-                return esky.winres
+        import esky.winres
+    return esky
 
 
 class Esky(object):
@@ -273,11 +261,13 @@ class Esky(object):
         if os.path.isfile(appdir_or_exe):
             self.appdir = appdir_from_executable(appdir_or_exe)
             vdir = appdir_or_exe[len(self.appdir):].split(os.sep)[1]
+            #vdir = appdir_or_exe[len(self.appdir):].split(os.sep)[2]
             details = split_app_version(vdir)
             self.name,self.active_version,self.platform = details
         else:
             self.active_version = None
             self.appdir = appdir_or_exe
+        self.appdir = os.path.abspath(self.appdir)
 
     def _get_version_finder(self):
         return self.__version_finder
@@ -293,13 +283,18 @@ class Esky(object):
         """Get the directory path in which self.version_finder can work."""
         return os.path.join(self.appdir,"updates")
 
+    def _get_versions_dir(self):
+        """Get the directory path containing individual version dirs."""
+        #return os.path.join(self.appdir,"versions")
+        return self.appdir
+
     def get_abspath(self,relpath):
         """Get the absolute path of a file within the current version."""
         if self.active_version:
             v = join_app_version(self.name,self.active_version,self.platform)
         else:
             v = join_app_version(self.name,self.version,self.platform)
-        return os.path.abspath(os.path.join(self.appdir,v,relpath))
+        return os.path.join(self._get_versions_dir(),v,relpath)
 
     def reinitialize(self):
         """Reinitialize internal state by poking around in the app directory.
@@ -308,7 +303,7 @@ class Esky(object):
         EskyBrokenError will be raised.  This should never happen unless
         another process has been messing with the files.
         """
-        best_version = get_best_version(self.appdir)
+        best_version = get_best_version(self._get_versions_dir())
         if best_version is None:
             raise EskyBrokenError("no frozen versions found")
         details = split_app_version(best_version)
@@ -492,8 +487,9 @@ class Esky(object):
         is required without duplicating the logic.
         """
         appdir = self.appdir
-        best_version = get_best_version(appdir)
-        new_version = get_best_version(appdir,include_partial_installs=True)
+        vsdir = self._get_versions_dir()
+        best_version = get_best_version(vsdir)
+        new_version = get_best_version(vsdir,include_partial_installs=True)
         #  If there's a partial install we must complete it, since it
         #  could have left exes in the bootstrap env and we don't want
         #  to accidentally delete their dependencies.
@@ -511,31 +507,32 @@ class Esky(object):
         if self.active_version and self.active_version != best_version:
             yield lambda: False
             manifest.add(self.active_version)
-        for nm in os.listdir(appdir):
-            if nm not in manifest:
-                fullnm = os.path.join(appdir,nm)
-                if is_version_dir(fullnm):
-                    #  It's an installed-but-obsolete version.  Properly
-                    #  uninstall it so it will clean up the bootstrap env.
-                    (_,v,_) = split_app_version(nm)
-                    try:
-                        yield (self.uninstall_version, (v,))
-                    except VersionLockedError:
-                        yield lambda: False
+        for tdir in (appdir,vsdir):
+            for nm in os.listdir(tdir):
+                if nm not in manifest:
+                    fullnm = os.path.join(tdir,nm)
+                    if is_version_dir(fullnm):
+                        #  It's an installed-but-obsolete version.  Properly
+                        #  uninstall it so it will clean up the bootstrap env.
+                        (_,v,_) = split_app_version(nm)
+                        try:
+                            yield (self.uninstall_version, (v,))
+                        except VersionLockedError:
+                            yield lambda: False
+                        else:
+                            yield (self._try_remove, (tdir,nm,manifest,))
+                    elif is_uninstalled_version_dir(fullnm):
+                        #  It's a partially-removed version; finish removing it.
+                        yield (self._try_remove, (tdir,nm,manifest,))
+                    elif ".old." in nm or nm.endswith(".old"):
+                        #  It's a temporary backup file; remove it.
+                        yield (self._try_remove, (tdir,nm,manifest,))
                     else:
-                        yield (self._try_remove, (appdir,nm,manifest,))
-                elif is_uninstalled_version_dir(fullnm):
-                    #  It's a partially-removed version; finish removing it.
-                    yield (self._try_remove, (appdir,nm,manifest,))
-                elif ".old." in nm or nm.endswith(".old"):
-                    #  It's a temporary backup file; remove it.
-                    yield (self._try_remove, (appdir,nm,manifest,))
-                else:
-                    #  It's an unaccounted-for entry in the bootstrap env.
-                    #  Can't prove it's safe to remove, so leave it.
-                    pass
+                        #  It's an unaccounted-for entry in the bootstrap env.
+                        #  Can't prove it's safe to remove, so leave it.
+                        pass
         #  If there are pending overwrites, try to do them.
-        ovrdir = os.path.join(appdir,best_version,ESKY_CONTROL_DIR,"overwrite")
+        ovrdir = os.path.join(vsdir,best_version,ESKY_CONTROL_DIR,"overwrite")
         if os.path.exists(ovrdir):
             try:
                 for (dirnm,_,filenms) in os.walk(ovrdir,topdown=False):
@@ -580,11 +577,11 @@ class Esky(object):
             exe = [sys.executable,"-c","import esky; esky.run_startup_hooks()","--esky-spawn-cleanup"]
         else:
             exe = sys.executable
-            #  Try to re-launch the best available version, so that the
-            #  currently in-use version can be cleaned up.
+            #  Try to re-launch the best available version, so that
+            #  the currently in-use version can be cleaned up.
             if self.active_version is not None:
-               appdir = self.appdir
-               bestver = get_best_version(appdir,include_partial_installs=True)
+               vsdir = self._get_versions_dir()
+               bestver = get_best_version(vsdir,include_partial_installs=True)
                if bestver is not None:
                    (_,version,_) = split_app_version(bestver)
                    if self.active_version != version:
@@ -614,8 +611,8 @@ class Esky(object):
             subprocess.Popen(exe,**kwds)
 
 
-    def _try_remove(self,appdir,path,manifest=[]):
-        """Try to remove the file/directory at the given path in the appdir.
+    def _try_remove(self,tdir,path,manifest=[]):
+        """Try to remove the file/directory at given path in the target dir.
 
         This method attempts to remove the file or directory at the given path,
         but will fail silently under a number of conditions:
@@ -626,7 +623,7 @@ class Esky(object):
             * if the path appears in the given manifest
 
         """
-        fullpath = os.path.join(appdir,path)
+        fullpath = os.path.join(tdir,path)
         if fullpath in sys.path:
             return False
         if path in manifest:
@@ -642,11 +639,11 @@ class Esky(object):
                         esky_paths.append(nm)
                     else:
                         subdir = os.path.join(path,nm)
-                        success &= self._try_remove(appdir,subdir,manifest)
+                        success &= self._try_remove(tdir,subdir,manifest)
                 if not success:
                     return False
                 for nm in sorted(esky_paths):
-                    self._try_remove(appdir,os.path.join(path,nm),manifest)
+                    self._try_remove(tdir,os.path.join(path,nm),manifest)
                 os.rmdir(fullpath)
             else:
                 os.unlink(fullpath)
@@ -770,16 +767,17 @@ class Esky(object):
         if self.version_finder is None:
             raise NoVersionFinderError
         #  Guard against malicious input (might be called with root privs)
+        vsdir = self._get_versions_dir()
         target = join_app_version(self.name,version,self.platform)
-        target = os.path.join(self.appdir,target)
-        assert os.path.dirname(target) == self.appdir
+        target = os.path.join(vsdir,target)
+        assert os.path.dirname(target) == vsdir
         #  Get the new version using the VersionFinder
         loc = self.version_finder.has_version(self,version)
         if not loc:
             loc = self.version_finder.fetch_version(self,version,callback)
         #  Adjust permissions to match the current version
         vdir = join_app_version(self.name,self.version,self.platform)
-        copy_ownership_info(os.path.join(self.appdir,vdir),loc)
+        copy_ownership_info(os.path.join(vsdir,vdir),loc)
         return loc
 
     @allow_from_sudo(str,iterator=True)
@@ -792,9 +790,10 @@ class Esky(object):
         if self.version_finder is None:
             raise NoVersionFinderError
         #  Guard against malicious input (might be called with root privs)
+        vsdir = self._get_versions_dir()
         target = join_app_version(self.name,version,self.platform)
-        target = os.path.join(self.appdir,target)
-        assert os.path.dirname(target) == self.appdir
+        target = os.path.join(vsdir,target)
+        assert os.path.dirname(target) == vsdir
         #  Get the new version using the VersionFinder
         loc = self.version_finder.has_version(self,version)
         if not loc:
@@ -805,7 +804,7 @@ class Esky(object):
                     loc = status["path"]
         #  Adjust permissions to match the current version
         vdir = join_app_version(self.name,self.version,self.platform)
-        copy_ownership_info(os.path.join(self.appdir,vdir),loc)
+        copy_ownership_info(os.path.join(vsdir,vdir),loc)
         yield {"status":"ready","path":loc}
 
     @allow_from_sudo(str)
@@ -819,10 +818,11 @@ class Esky(object):
         if self.sudo_proxy is not None:
             return self.sudo_proxy.install_version(version)
         #  Extract update then rename into position in main app directory
+        vsdir = self._get_versions_dir()
         target = join_app_version(self.name,version,self.platform)
-        target = os.path.join(self.appdir,target)
+        target = os.path.join(vsdir,target)
         #  Guard against malicious input (might be called with root privs)
-        assert os.path.dirname(target) == self.appdir
+        assert os.path.dirname(target) == vsdir
         if not os.path.exists(target):
             self.fetch_version(version)
             source = self.version_finder.has_version(self,version)
@@ -830,7 +830,7 @@ class Esky(object):
         try:
             if not os.path.exists(target):
                 os.rename(source,target)
-            trn = esky.fstransact.FSTransaction()
+            trn = esky.fstransact.FSTransaction(self.appdir)
             try:
                 self._unpack_bootstrap_env(version,trn)
             except Exception:
@@ -843,9 +843,10 @@ class Esky(object):
 
     def _unpack_bootstrap_env(self,version,trn):
         """Unpack the bootstrap env from the given target directory."""
+        vsdir = self._get_versions_dir()
         vdir = join_app_version(self.name,version,self.platform)
-        target = os.path.join(self.appdir,vdir)
-        assert os.path.dirname(target) == self.appdir
+        target = os.path.join(vsdir,vdir)
+        assert os.path.dirname(target) == vsdir
         #  Move new bootrapping environment into main app dir.
         #  Be sure to move dependencies before executables.
         bootstrap = os.path.join(target,ESKY_CONTROL_DIR,"bootstrap")
@@ -860,7 +861,8 @@ class Esky(object):
                     if not files_differ(bssrc,bsdst):
                         trn.remove(bssrc)
                     elif esky.winres.is_safe_to_overwrite(bssrc,bsdst):
-                        ovrdir = os.path.join(target,ESKY_CONTROL_DIR,"overwrite")
+                        ovrdir = os.path.join(target,ESKY_CONTROL_DIR)
+                        ovrdir = os.path.join(ovrdir,"overwrite")
                         if not os.path.exists(ovrdir):
                             os.mkdir(ovrdir)
                         trn.move(bssrc,os.path.join(ovrdir,nm))
@@ -879,10 +881,11 @@ class Esky(object):
         """Uninstall the specified version of the app."""
         if self.sudo_proxy is not None:
             return self.sudo_proxy.uninstall_version(version)
+        vsdir = self._get_versions_dir()
         target_name = join_app_version(self.name,version,self.platform)
-        target = os.path.join(self.appdir,target_name)
+        target = os.path.join(vsdir,target_name)
         #  Guard against malicious input (might be called with root privs)
-        assert os.path.dirname(target) == self.appdir
+        assert os.path.dirname(target) == vsdir
         # TODO: remove compatability hooks
         lockfile = os.path.join(target,ESKY_CONTROL_DIR,"lockfile.txt")
         if not os.path.exists(lockfile):
@@ -899,7 +902,7 @@ class Esky(object):
             #  Clean up the bootstrapping environment in a transaction.
             #  This might fail on windows if the version is locked.
             try:
-                trn = esky.fstransact.FSTransaction()
+                trn = esky.fstransact.FSTransaction(self.appdir)
                 try:
                     self._cleanup_bootstrap_env(version,trn)
                 except Exception:
@@ -944,7 +947,7 @@ class Esky(object):
         target_name = join_app_version(self.name,version,self.platform)
         #  Get set of all files that must stay in the main appdir
         to_keep = set()
-        for vname in os.listdir(self.appdir):
+        for vname in os.listdir(self._get_versions_dir()):
             if vname == target_name:
                 continue
             details = split_app_version(vname)
@@ -969,9 +972,12 @@ class Esky(object):
         This is the set of files/directories that the given version expects
         to be in the main app directory.
         """
-        mpath = os.path.join(self.appdir,vdir,ESKY_CONTROL_DIR,"bootstrap-manifest.txt")
+        vsdir = self._get_versions_dir()
+        mpath = os.path.join(vsdir,vdir,ESKY_CONTROL_DIR)
+        mpath = os.path.join(mpath,"bootstrap-manifest.txt")
+        # TODO: remove compatability hooks
         if not os.path.exists(mpath):
-            mpath = os.path.join(self.appdir,vdir,"esky-bootstrap.txt")
+            mpath = os.path.join(vsdir,vdir,"esky-bootstrap.txt")
         manifest = set()
         try:
             with open(mpath,"rt") as mf:
@@ -996,6 +1002,7 @@ def run_startup_hooks():
     # Lock the version dir while we're executing, so other instances don't
     # delete files out from under us.
     if getattr(sys,"frozen",False):
+        # TODO: how to handle versions stored in a subdir?
         appdir = appdir_from_executable(sys.executable)
         vdir = sys.executable[len(appdir):].split(os.sep)[1]
         vdir = os.path.join(appdir,vdir)

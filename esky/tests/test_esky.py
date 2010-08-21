@@ -27,6 +27,7 @@ import esky
 import esky.patch
 import esky.sudo
 from esky import bdist_esky
+from esky.bdist_esky import Executable
 from esky.util import extract_zipfile, deep_extract_zipfile, get_platform, \
                       ESKY_CONTROL_DIR, files_differ
 from esky.fstransact import FSTransaction
@@ -132,7 +133,7 @@ class TestEsky(unittest.TestCase):
     if sys.platform == "win32":
         def test_esky_cxfreeze_nocustomchainload(self):
             with setenv("ESKY_NO_CUSTOM_CHAINLOAD","1"):
-               bscode = "_chainload = _orig_chainload\nbootstrap()"
+               bscode = ["_chainload = _orig_chainload",None]
                self._run_eskytester({"bdist_esky":{"freezer_module":"cxfreeze",
                                                    "bootstrap_code":bscode}})
     if esky.sudo.can_get_root():
@@ -175,9 +176,12 @@ class TestEsky(unittest.TestCase):
         options2 = options.copy()
         options2["bdist_esky"] = options["bdist_esky"].copy()
         options2["bdist_esky"]["bundle_msvcrt"] = True
-        dist_setup(version="0.1",scripts=["eskytester/script1.py"],options=options,script_args=["bdist_esky"],**metadata)
-        dist_setup(version="0.2",scripts=["eskytester/script1.py","eskytester/script2.py"],options=options2,script_args=["bdist_esky"],**metadata)
-        dist_setup(version="0.3",scripts=["eskytester/script2.py","eskytester/script3.py"],options=options,script_args=["bdist_esky_patch"],**metadata)
+        script1 = "eskytester/script1.py"
+        script2 = Executable([None,open("eskytester/script2.py")],name="script2")
+        script3 = "eskytester/script3.py"
+        dist_setup(version="0.1",scripts=[script1],options=options,script_args=["bdist_esky"],**metadata)
+        dist_setup(version="0.2",scripts=[script1,script2],options=options2,script_args=["bdist_esky"],**metadata)
+        dist_setup(version="0.3",scripts=[script2,script3],options=options,script_args=["bdist_esky_patch"],**metadata)
         os.unlink(os.path.join(tdir,"dist","eskytester-0.3.%s.zip"%(platform,)))
         #  Check that the patches apply cleanly
         uzdir = os.path.join(tdir,"unzip")
@@ -254,7 +258,8 @@ class TestEsky(unittest.TestCase):
     appdir = tempfile.mkdtemp()
     try: 
         vdir = os.path.join(appdir,"testapp-0.1.%s" % (platform,))
-        os.mkdir(vdir)
+        #vdir = os.path.join(appdir,"versions","testapp-0.1.%s" % (platform,))
+        os.makedirs(vdir)
         os.mkdir(os.path.join(vdir,ESKY_CONTROL_DIR))
         open(os.path.join(vdir,ESKY_CONTROL_DIR,"bootstrap-manifest.txt"),"wb").close()
         e1 = esky.Esky(appdir,"http://example.com/downloads/")
@@ -299,6 +304,10 @@ class TestEsky(unittest.TestCase):
         os.mkdir(os.path.join(appdir,"testapp-0.1"))
         os.mkdir(os.path.join(appdir,"testapp-0.1",ESKY_CONTROL_DIR))
         open(os.path.join(appdir,"testapp-0.1",ESKY_CONTROL_DIR,"bootstrap-manifest.txt"),"wb").close()
+        #os.mkdir(os.path.join(appdir,"versions"))
+        #os.mkdir(os.path.join(appdir,"versions","testapp-0.1"))
+        #os.mkdir(os.path.join(appdir,"versions","testapp-0.1",ESKY_CONTROL_DIR))
+        #open(os.path.join(appdir,"versions","testapp-0.1",ESKY_CONTROL_DIR,"bootstrap-manifest.txt"),"wb").close()
         e1 = esky.Esky(appdir,"http://example.com/downloads/")
         e2 = esky.Esky(appdir,"http://example.com/downloads/")
         trigger1 = threading.Event(); trigger2 = threading.Event()
@@ -380,6 +389,16 @@ class TestFSTransact(unittest.TestCase):
     def assertContents(self,path,contents):
         with open(self.path(path),"rb") as f:
             self.assertEquals(f.read().decode(),contents)
+
+    def test_no_move_outside_root(self):
+        self.setContents("file1","hello world")
+        trn = FSTransaction(self.testdir)
+        trn.move(self.path("file1"),"file2")
+        trn.commit()
+        self.assertContents("file2","hello world")
+        trn = FSTransaction(self.testdir)
+        self.assertRaises(ValueError,trn.move,self.path("file2"),"../file1")
+        trn.abort()
 
     def test_move_file(self):
         self.setContents("file1","hello world")
