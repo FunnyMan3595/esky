@@ -32,6 +32,8 @@ use during the bootstrap process:
 import sys
 import errno
 
+ESKY_CONTROL_DIR = "esky-files"
+
 #  The os module is not builtin, so we grab what we can from the
 #  platform-specific modules and fudge the rest.
 if "posix" in sys.builtin_module_names:
@@ -40,18 +42,44 @@ if "posix" in sys.builtin_module_names:
     SEP = "/"
 elif "nt" in sys.builtin_module_names:
     fcntl = None
+    import nt
     from nt import listdir, stat, unlink, rename, spawnv, P_WAIT
     SEP = "\\"
     #  The standard execv terminates the spawning process, which makes
-    #  it impossible to wait for it.  This alternative is waitable, but
-    #  risks leaving zombie children if it is killed externally.
-    #  TODO: some way to kill children when this is killed - should be doable
-    #        with some custom code in child startup.
+    #  it impossible to wait for it.  This alternative is waitable, and
+    #  uses the esky.slaveproc machinery to avoid leaving zombie children.
     def execv(filename,args):
+        #  Create an O_TEMPORARY file and pass its name to the slave process.
+        #  When this master process dies, the file will be deleted and the
+        #  slave process will know to terminate.
+        tdir = nt.environ.get("TEMP",None)
+        if tdir:
+            tfile = None
+            try:
+                nt.mkdir(pathjoin(tdir,"esky-slave-procs"))
+            except EnvironmentError:
+                pass
+            if exists(pathjoin(tdir,"esky-slave-procs")):
+                flags = nt.O_CREAT|nt.O_EXCL|nt.O_TEMPORARY|nt.O_NOINHERIT
+                for i in xrange(10):
+                    tfilenm = "slave-%d.%d.txt" % (nt.getpid(),i,)
+                    tfilenm = pathjoin(tdir,"esky-slave-procs",tfilenm)
+                    try:
+                        tfile = nt.open(tfilenm,flags)
+                        break
+                    except EnvironmentError:
+                        raise
+                        pass
+        if tdir and tfile:
+            args.insert(1,tfilenm)
+            args.insert(1,"--esky-slave-proc")
         res = spawnv(P_WAIT,filename,args)
         raise SystemExit(res)
 else:
     raise RuntimeError("unsupported platform: " + sys.platform)
+
+
+__esky_name__ = None
 
 
 def pathjoin(*args):
@@ -70,7 +98,8 @@ def exists(path):
     """Local re-implementation of os.path.exists."""
     try:
         stat(path)
-    except EnvironmentError, e:
+    except EnvironmentError:
+        e = sys.exc_info()[1]
         if e.errno not in (errno.ENOENT,errno.ENOTDIR,errno.ESRCH,):
             raise
         else:
@@ -131,12 +160,40 @@ def chainload(target_dir):
     except EnvironmentError:
         #  If the bootstrap file is missing, the version is being uninstalled.
         #  Our only option is to re-execute ourself and find the new version.
-        if exists(pathjoin(target_dir,"esky-bootstrap.txt")):
-            raise
-        execv(sys.executable,sys.argv)
+        if exists(dirname(target_dir)):
+            if not exists(pathjoin(target_dir,ESKY_CONTROL_DIR,"bootstrap-manifest.txt")):
+                # TODO: remove compatability hook
+                if not exists(pathjoin(target_dir,"esky-bootstrap.txt")):
+                    execv(sys.executable,sys.argv)
+        raise
     else:
         #  If all goes well, we can actually launch the target version.
         _chainload(target_dir)
+
+
+def get_exe_locations(target_dir):
+    """Generate possible locations from which to chainload in the target dir."""
+    appdir = appdir_from_executable(sys.executable)
+    #  If we're in an appdir, first try to launch from within "<appname>.app"
+    #  directory.  We must also try the default scheme for backwards compat.
+    if sys.platform == "darwin":
+        if basename(dirname(sys.executable)) == "MacOS":
+            if __esky_name__ is None:
+                yield pathjoin(target_dir,
+                               __esky_name__+".app",
+                               sys.executable[len(appdir)+1:])
+            else:
+                for nm in listdir(target_dir):
+                    if nm.endswith(".app"):
+                        yield pathjoin(target_dir,
+                                       nm,
+                                       sys.executable[len(appdir)+1:])
+    #  This is the default scheme: the same path as the exe in the appdir.
+    yield target_dir + sys.executable[len(appdir):]
+    #  If sys.executable was a backup file, try using orig filename.
+    orig_exe = get_original_filename(sys.executable)
+    if orig_exe is not None:
+        yield target_dir + orig_executable[len(appdir):]
 
 
 def _chainload(target_dir):
@@ -145,18 +202,17 @@ def _chainload(target_dir):
     Specific freezer modules may provide a more efficient, reliable or
     otherwise better version of this function.
     """
-    appdir = dirname(target_dir)
-    target_exe = target_dir + sys.executable[len(appdir):]
-    try:
-        execv(target_exe,[target_exe] + sys.argv[1:])
-    except EnvironmentError, e:
-        if e.errno == errno.ENOENT:
-            # Tried to chainload something that doesn't exist.
-            # Perhaps executing from a backup file?
-            orig_exe = get_original_filename(sys.executable)
-            if orig_exe is not None:
-                target_exe = target+dir + orig_executable[len(appdir):]
-                execv(target_exe,[target_exe] + sys.argv[1:])
+    exc_type,exc_value,traceback = None,None,None
+    for target_exe in get_exe_locations(target_dir):
+        try:
+            execv(target_exe,[target_exe] + sys.argv[1:])
+        except EnvironmentError:
+            exc_type,exc_value,traceback = sys.exc_info()
+            if exc_value.errno != errno.ENOENT:
+                raise
+    else:
+        if exc_value is not None:
+            raise exc_type,exc_value,traceback
 
 
 def get_best_version(appdir,include_partial_installs=False,appname=None):
@@ -226,27 +282,42 @@ def get_all_versions(appdir,include_partial_installs=False):
 def is_version_dir(vdir):
     """Check whether the given directory contains an esky app version.
 
-    Currently, it only need contain the "esky-bootstrap.txt" file.
+    Currently it only need contain the "esky-files/bootstrap-mainfest.txt" file.
     """
-    return exists(pathjoin(vdir,"esky-bootstrap.txt"))
+    if exists(pathjoin(vdir,ESKY_CONTROL_DIR,"bootstrap-manifest.txt")):
+        return True
+    # TODO: remove compatability hook
+    if exists(pathjoin(vdir,"esky-bootstrap.txt")):
+        return True
+    return False
 
 
 def is_installed_version_dir(vdir):
     """Check whether the given version directory is fully installed.
 
     Currently, a completed installation is indicated by the lack of an
-    "esky-bootstrap" directory.
+    "esky-files/bootstrap" directory.
     """
-    return not exists(pathjoin(vdir,"esky-bootstrap"))
+    # TODO: remove compatability hook
+    if not exists(pathjoin(vdir,ESKY_CONTROL_DIR,"bootstrap")):
+        if not exists(pathjoin(vdir,"esky-bootstrap")):
+            return True
+    return False
 
 
 def is_uninstalled_version_dir(vdir):
     """Check whether the given version directory is partially uninstalled.
 
-    A partially-uninstalled version dir has had its "esky-bootstrap.txt"
-    file renamed to "esky-bootstrap-old.txt".
+    A partially-uninstalled version dir has had the "bootstrap-manifest.txt"
+    renamed to "bootstrap-manifest-old.txt".
     """
-    return exists(pathjoin(vdir,"esky-bootstrap-old.txt"))
+    if exists(pathjoin(vdir,ESKY_CONTROL_DIR,"bootstrap-manifest-old.txt")):
+        return True
+    # TODO: remove compatability hooks
+    if exists(pathjoin(vdir,"esky-bootstrap-old.txt")):
+        return True
+    return False
+    
 
 
 def split_app_version(s):
@@ -365,10 +436,13 @@ def lock_version_dir(vdir):
     if sys.platform == "win32":
         #  On win32, we just hold bootstrap file open for reading.
         #  This will prevent it from being renamed during uninstall.
-        lockfile = pathjoin(vdir,"esky-bootstrap.txt")
+        lockfile = pathjoin(vdir,ESKY_CONTROL_DIR,"bootstrap-manifest.txt")
+        # TODO: remove compatability hooks
+        if not exists(lockfile):
+            lockfile = pathjoin(vdir,"esky-bootstrap.txt")
         _locked_version_dirs.setdefault(vdir,[]).append(open(lockfile,"rt"))
     else:
-        #  On posix platforms we take a shared flock on esky-lockfile.txt.
+        #  On posix platforms we take a shared flock on esky-files/lockfile.txt.
         #  While fcntl.fcntl locks are apparently the new hotness, they have
         #  unfortunate semantics that we don't want for this application:
         #      * not inherited across fork()
@@ -376,7 +450,10 @@ def lock_version_dir(vdir):
         #  fcntl.flock doesn't have these problems, but may fail on NFS.
         #  To complicate matters, python sometimes emulated flock with fcntl!
         #  We therefore use a separate lock file to avoid unpleasantness.
-        lockfile = pathjoin(vdir,"esky-lockfile.txt")
+        lockfile = pathjoin(vdir,ESKY_CONTROL_DIR,"lockfile.txt")
+        # TODO: remove compatability hooks
+        if not exists(lockfile):
+            lockfile = pathjoin(vdir,"esky-lockfile.txt")
         f = open(lockfile,"r")
         _locked_version_dirs.setdefault(vdir,[]).append(f)
         fcntl.flock(f,fcntl.LOCK_SH)

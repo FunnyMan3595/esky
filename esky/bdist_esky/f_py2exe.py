@@ -27,7 +27,7 @@ from glob import glob
 from py2exe.build_exe import py2exe
 
 import esky
-from esky.util import is_core_dependency
+from esky.util import is_core_dependency, ESKY_CONTROL_DIR
 from esky import winres
 
 try:
@@ -119,11 +119,6 @@ def freeze(dist):
     cmd = custom_py2exe(dist.distribution)
     cmd.includes = includes
     cmd.excludes = excludes
-    if "bundle_files" not in options and "zipfile" not in options:
-        #  If the user hasn't expressed a preference, bundle all PYD libs
-        #  into the zipfile as well.  This allows us to use a more efficient
-        #  chainloader mechanism.
-        cmd.bundle_files = 2
     for (nm,val) in options.iteritems():
         setattr(cmd,nm,val)
     cmd.dist_dir = dist.freeze_dir
@@ -139,7 +134,8 @@ def freeze(dist):
             dist.mkpath(dstdir)
         dist.copy_file(src,dst)
     #  Place a marker fileso we know how it was frozen
-    marker_file = "esky-f-py2exe-%d%d.txt" % sys.version_info[:2]
+    os.mkdir(os.path.join(dist.freeze_dir,ESKY_CONTROL_DIR))
+    marker_file = os.path.join(ESKY_CONTROL_DIR,"f-py2exe-%d%d.txt")%sys.version_info[:2]
     open(os.path.join(dist.freeze_dir,marker_file),"w").close()
     #  Copy package data into the library.zip
     #  For now, we don't try to put package data into a bundled zipfile.
@@ -161,14 +157,17 @@ def freeze(dist):
     code_source.append(_FAKE_ESKY_BOOTSTRAP_MODULE)
     code_source.append(_CUSTOM_WIN32_CHAINLOADER)
     code_source.append("__esky_name__ = '%s'" % (dist.distribution.get_name(),))
-    if dist.bootstrap_module is None:
-        code_source.append("bootstrap()")
-    else:
+    if dist.bootstrap_code is not None:
+        code_source.append(dist.bootstrap_code)
+        code_source.append("raise RuntimeError('didnt chainload')")
+    elif dist.bootstrap_module is not None:
         bsmodule = __import__(dist.bootstrap_module)
         for submod in dist.bootstrap_module.split(".")[1:]:
             bsmodule = getattr(bsmodule,submod)
         code_source.append(inspect.getsource(bsmodule))
         code_source.append("raise RuntimeError('didnt chainload')")
+    else:
+        code_source.append("bootstrap()")
     code_source = "\n".join(code_source)
     code = marshal.dumps([compile(code_source,"__main__.py","exec")])
     coderes = struct.pack("iiii",
@@ -176,7 +175,7 @@ def freeze(dist):
                      0, # no optimization
                      False,  # normal buffered output
                      len(code),
-                     ) + "\000" + code + "\000"
+                     ) + "\x00" + code + "\x00\x00"
     #  We try to bundle the python DLL into all bootstrap executables, even
     #  if it's not bundled in the frozen distribution.  This helps keep the
     #  bootstrap env small and minimises the chances of something going wrong.
@@ -191,7 +190,7 @@ def freeze(dist):
                 continue
             if nm.lower().endswith(".pyd") or nm.lower().endswith(".dll"):
                 #  There's an unbundled C-extension, so we can't bundle
-                #  the DLL  or our bootstrapper won't work.
+                #  the DLL or our bootstrapper won't work.
                 pydll_bytes = None
                 break
         else:
@@ -252,7 +251,7 @@ _CUSTOM_WIN32_CHAINLOADER = """
 _orig_chainload = _chainload
 def _chainload(target_dir):
   # careful to escape percent-sign, this gets interpolated below
-  marker_file = "esky-f-py2exe-%%d%%d.txt" %% sys.version_info[:2]
+  marker_file = pathjoin(ESKY_CONTROL_DIR,"f-py2exe-%%d%%d.txt")%%sys.version_info[:2]
   pydll = "python%%s%%s.dll" %% sys.version_info[:2]
   mydir = dirname(sys.executable)
   if not exists(pathjoin(target_dir,marker_file)):
@@ -260,6 +259,8 @@ def _chainload(target_dir):
   else:
       for nm in listdir(target_dir):
           if nm == pydll:
+              continue
+          if nm.lower().startswith("msvcr"):
               continue
           if nm.lower().endswith(".pyd") or nm.lower().endswith(".dll"):
               #  The freeze dir contains unbundled C extensions.
@@ -337,10 +338,13 @@ def _chainload(target_dir):
           codestart += 1
           codelist = marshal.loads(data[codestart:codestart+codesz])
           # Execute all code in the context of __main__ module.
-          locals = globals = sys.modules["__main__"].__dict__
+          # Remove our own cruft from it before doing so.
+          d_locals = d_globals = sys.modules["__main__"].__dict__
+          d_locals.clear()
+          d_locals["__name__"] = "__main__"
           for code in codelist:
-              exec code in globals, locals
-          sys.exit(0)
+              exec code in d_globals, d_locals
+          raise SystemExit(0)
 """ % (inspect.getsource(winres.load_resource).replace("\n","\n"+" "*6),)
 
 

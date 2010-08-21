@@ -89,15 +89,19 @@ def freeze(dist):
     if sys.platform == "win32":
         code_source.append(_CUSTOM_WIN32_CHAINLOADER)
     code_source.append("__esky_name__ = '%s'" % (dist.distribution.get_name(),))
-    if dist.bootstrap_module is None:
-        code_source.append("bootstrap()")
-    else:
+    if dist.bootstrap_code is not None:
+        code_source.append("__name__ = '__main__'")
+        code_source.append(dist.bootstrap_code)
+        code_source.append("raise RuntimeError('didnt chainload')")
+    elif dist.bootstrap_module is not None:
         code_source.append("__name__ = '__main__'")
         bsmodule = __import__(dist.bootstrap_module)
         for submod in dist.bootstrap_module.split(".")[1:]:
             bsmodule = getattr(bsmodule,submod)
         code_source.append(inspect.getsource(bsmodule))
         code_source.append("raise RuntimeError('didnt chainload')")
+    else:
+        code_source.append("bootstrap()")
     code_source = "\n".join(code_source)
     maincode = imp.get_magic() + struct.pack("<i",0)
     maincode += marshal.dumps(compile(code_source,INITNAME+".py","exec"))
@@ -107,6 +111,10 @@ def freeze(dist):
     eskybscode = imp.get_magic() + struct.pack("<i",0)
     eskybscode += marshal.dumps(compile("","esky/bootstrap.py","exec"))
     #  Copy any core dependencies
+    if "fcntl" not in sys.builtin_module_names:
+        for nm in os.listdir(dist.freeze_dir):
+            if nm.startswith("fcntl"):
+                dist.copy_to_bootstrap_env(nm)
     for nm in os.listdir(dist.freeze_dir):
         if is_core_dependency(nm):
             dist.copy_to_bootstrap_env(nm)
@@ -140,6 +148,10 @@ def _normalise_opt_name(nm):
 #  On Windows, execv is flaky and expensive.  If the chainloader is the same
 #  python version as the target exe, we can munge sys.path to bootstrap it
 #  into the existing process.
+if sys.version_info[0] < 3:
+    EXEC_STATEMENT = "exec code in globals()"
+else:
+    EXEC_STATEMENT = "exec(code,globals())"
 _CUSTOM_WIN32_CHAINLOADER = """
 _orig_chainload = _chainload
 def _chainload(target_dir):
@@ -151,7 +163,7 @@ def _chainload(target_dir):
       sys.bootstrap_executable = sys.executable
       sys.executable = pathjoin(target_dir,basename(sys.executable))
       sys.argv[0] = sys.executable
-      for i in xrange(len(sys.path)):
+      for i in range(len(sys.path)):
           sys.path[i] = sys.path[i].replace(mydir,target_dir)
       import zipimport
       for init_path in sys.path:
@@ -172,8 +184,9 @@ def _chainload(target_dir):
               SHARED_ZIP_FILE_NAME = SHARED_ZIP_FILE_NAME.replace(mydir,target_dir)
               INITSCRIPT_ZIP_FILE_NAME = init_path
               try:
-                  exec code in globals()
-              except zipimport.ZipImportError, e:
+                  %s
+              except zipimport.ZipImportError:
+                  e = sys.exc_info()[1]
                   #  If it can't find the __main__{sys.executable} script,
                   #  the user might be running from a backup exe file.
                   #  Fall back to original chainloader to attempt workaround.
@@ -183,6 +196,6 @@ def _chainload(target_dir):
               sys.exit(0)
       else:
           _orig_chainload(target_dir)
-""" % (INITNAME,)
+""" % (INITNAME,EXEC_STATEMENT)
 
 

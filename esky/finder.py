@@ -11,6 +11,8 @@ specified URL to look for new versions.
 
 """
 
+from __future__ import with_statement
+
 import os
 import re
 import stat
@@ -22,7 +24,8 @@ from urlparse import urlparse, urljoin
 
 from esky.bootstrap import parse_version, join_app_version
 from esky.errors import *
-from esky.util import extract_zipfile, copy_ownership_info
+from esky.util import deep_extract_zipfile, copy_ownership_info, \
+                      ESKY_CONTROL_DIR
 from esky.patch import apply_patch, PatchError
 
 
@@ -32,9 +35,6 @@ class VersionFinder(object):
     This class defines the interface expected of a VersionFinder object.
     The important methods expected from any VersionFinder are:
 
-        cleanup:  perform maintenance/cleanup tasks in the workdir
-                  (e.g. removing old or broken downloads)
-
         find_versions:  get a list of all available versions for a given esky
 
         fetch_version:  make the specified version available locally
@@ -42,10 +42,19 @@ class VersionFinder(object):
 
         has_version:  check that the specified version is available locally
 
+        cleanup:  perform maintenance/cleanup tasks in the workdir
+                  (e.g. removing old or broken downloads)
+
+        needs_cleanup:  check whether maintenance/cleanup tasks are required
+
     """
 
     def __init__(self):
         pass
+
+    def needs_cleanup(self,app):
+        """Check whether the cleanup() method has any work to do."""
+        return False
 
     def cleanup(self,app):
         """Perform maintenance tasks in the working directory."""
@@ -55,8 +64,26 @@ class VersionFinder(object):
         """Find available versions of the app, returned as a list."""
         raise NotImplementedError
 
-    def fetch_version(self,app,version):
-        """Fetch a specific version of the app into a local directory."""
+    def fetch_version(self,app,version,callback=None):
+        """Fetch a specific version of the app into a local directory.
+
+        If specified, `callback` must be a callable object taking a dict as
+        its only argument.  It will be called periodically with status info
+        about the progress of the download.
+        """
+        for status in self.fetch_version_iter(app,version):
+            if callback is not None:
+                callback(status)
+        return self.has_version(app,version)
+
+    def fetch_version_iter(self,app,version):
+        """Fetch a specific version of the app, using iterator control flow.
+
+        This is just like the fetch_version() method, but it returns an
+        iterator which you must step through in order to process the download
+        The items yielded by the iterator are the same as those that would
+        be received by the callback function in fetch_version().
+        """
         raise NotImplementedError
 
     def has_version(self,app,version):
@@ -87,19 +114,36 @@ class DefaultVersionFinder(VersionFinder):
         super(DefaultVersionFinder,self).__init__()
         self.version_graph = VersionGraph()
 
-    def _workdir(self,app,nm):
+    def _workdir(self,app,nm,create=True):
         """Get full path of named working directory, inside the given app."""
         updir = app._get_update_dir()
         workdir = os.path.join(updir,nm)
-        for target in (updir,workdir):
-            try:
-                os.mkdir(target)
-            except OSError, e:
-                if e.errno not in (17,183):
-                    raise
-            else:
-                copy_ownership_info(app.appdir,target)
+        if create:
+            for target in (updir,workdir):
+                try:
+                    os.mkdir(target)
+                except OSError, e:
+                    if e.errno not in (17,183):
+                        raise
+                else:
+                    copy_ownership_info(app.appdir,target)
         return workdir
+
+    def needs_cleanup(self,app):
+        """Check whether the cleanup() method has any work to do."""
+        dldir = self._workdir(app,"downloads",create=False)
+        if os.path.isdir(dldir):
+            for nm in os.listdir(dldir):
+                return True
+        updir = self._workdir(app,"unpack",create=False)
+        if os.path.isdir(updir):
+            for nm in os.listdir(updir):
+                return True
+        rddir = self._workdir(app,"ready",create=False)
+        if os.path.isdir(rddir):
+            for nm in os.listdir(rddir):
+                return True
+        return False
 
     def cleanup(self,app):
         # TODO: hang onto the latest downloaded version
@@ -114,7 +158,9 @@ class DefaultVersionFinder(VersionFinder):
             shutil.rmtree(os.path.join(rddir,nm))
 
     def open_url(self,url):
-        return urllib2.urlopen(url)
+        f = urllib2.urlopen(url)
+        f.size = f.headers.get("content-length",None)
+        return f
 
     def find_versions(self,app):
         version_re = "[a-zA-Z0-9\\.-_]+"
@@ -124,7 +170,11 @@ class DefaultVersionFinder(VersionFinder):
         filename_re = filename_re % (appname_re,version_re,)
         link_re = "href=['\"](?P<href>([^'\"]*/)?%s)['\"]" % (filename_re,)
         # TODO: would be nice not to have to guess encoding here.
-        downloads = self.open_url(self.download_url).read().decode("utf-8")
+        df = self.open_url(self.download_url)
+        try:
+            downloads = df.read().decode("utf-8")
+        finally:
+            df.close()
         for match in re.finditer(link_re,downloads,re.I):
             version = match.group("version")
             href = match.group("href")
@@ -137,7 +187,7 @@ class DefaultVersionFinder(VersionFinder):
             self.version_graph.add_link(from_version or "",version,href,cost)
         return self.version_graph.get_versions(app.version)
 
-    def fetch_version(self,app,version):
+    def fetch_version_iter(self,app,version):
         #  There's always the possibility that a patch fails to apply.
         #  _prepare_version will remove such patches from the version graph;
         #  we loop until we find a path that applies, or we run out of options.
@@ -151,35 +201,46 @@ class DefaultVersionFinder(VersionFinder):
                 raise EskyVersionError(version)
             local_path = []
             for url in path:
-                local_path.append((self._fetch_file(app,url),url))
+                for status in self._fetch_file_iter(app,url):
+                    if status["status"] == "ready":
+                        local_path.append((status["path"],url))
+                    else:
+                        yield status
             try:
                 self._prepare_version(app,version,local_path)
             except PatchError:
-                pass
-        return name
+                yield {"status":"retrying","size":None}
+        yield {"status":"ready","path":name}
 
-    def _fetch_file(self,app,url):
-        infile = self.open_url(urljoin(self.download_url,url))
+    def _fetch_file_iter(self,app,url):
         nm = os.path.basename(urlparse(url).path)
         outfilenm = os.path.join(self._workdir(app,"downloads"),nm)
         if not os.path.exists(outfilenm):
-            partfilenm = outfilenm + ".part"
-            partfile = open(partfilenm,"wb")
+            infile = self.open_url(urljoin(self.download_url,url))
+            if not hasattr(infile,"size"):
+                infile.size = None
             try:
-                data = infile.read(1024*512)
-                while data:
-                    partfile.write(data)
+                partfilenm = outfilenm + ".part"
+                partfile = open(partfilenm,"wb")
+                try:
                     data = infile.read(1024*512)
-            except Exception:
+                    while data:
+                        yield {"status": "downloading",
+                               "size": infile.size,
+                               "received": partfile.tell(),
+                        }
+                        partfile.write(data)
+                        data = infile.read(1024*512)
+                except Exception:
+                    partfile.close()
+                    os.unlink(partfilenm)
+                    raise
+                else:
+                    partfile.close()
+                    os.rename(partfilenm,outfilenm)
+            finally:
                 infile.close()
-                partfile.close()
-                os.unlink(partfilenm)
-                raise
-            else:
-                infile.close()
-                partfile.close()
-                os.rename(partfilenm,outfilenm)
-        return outfilenm
+        yield {"status":"ready","path":outfilenm}
 
     def _prepare_version(self,app,version,path):
         """Prepare the requested version from downloaded data.
@@ -194,6 +255,8 @@ class DefaultVersionFinder(VersionFinder):
                 self._copy_best_version(app,uppath)
             else:
                 if path[0][0].endswith(".patch"):
+                    #  We're direcly applying a series of patches.
+                    #  Copy the current version across and go from there.
                     try:
                         self._copy_best_version(app,uppath)
                     except EnvironmentError, e:
@@ -202,7 +265,17 @@ class DefaultVersionFinder(VersionFinder):
                         raise PatchError(err)
                     patches = path
                 else:
-                    extract_zipfile(path[0][0],uppath)
+                    #  We're starting from a zipfile.  Extract the first dir
+                    #  containing more than a single item and go from there.
+                    try:
+                        deep_extract_zipfile(path[0][0],uppath)
+                    except (zipfile.BadZipfile,zipfile.LargeZipFile):
+                        self.version_graph.remove_all_links(path[0][1])
+                        try:
+                            os.unlink(path[0][0])
+                        except EnvironmentError:
+                            pass
+                        raise
                     patches = path[1:]
                 for (patchfile,patchurl) in patches:
                     try:
@@ -210,20 +283,25 @@ class DefaultVersionFinder(VersionFinder):
                             apply_patch(uppath,f)
                     except PatchError:
                         self.version_graph.remove_all_links(patchurl)
+                        try:
+                            os.unlink(patchfile)
+                        except EnvironmentError:
+                            pass
                         raise
-            # Move anything that's not the version dir into esky-bootstrap
+            # Move anything that's not the version dir into esky/bootstrap
             vdir = join_app_version(app.name,version,app.platform)
-            bspath = os.path.join(uppath,vdir,"esky-bootstrap")
+            bspath = os.path.join(uppath,vdir,ESKY_CONTROL_DIR,"bootstrap")
             if not os.path.isdir(bspath):
                 os.makedirs(bspath)
             for nm in os.listdir(uppath):
                 if nm != vdir:
                     os.rename(os.path.join(uppath,nm),os.path.join(bspath,nm))
-            # Check that it has an esky-bootstrap.txt file
-            bsfile = os.path.join(uppath,vdir,"esky-bootstrap.txt")
+            # Check that it has an esky-files/bootstrap-manifest.txt file
+            bsfile = os.path.join(uppath,vdir,ESKY_CONTROL_DIR,"bootstrap-manifest.txt")
             if not os.path.exists(bsfile):
                 self.version_graph.remove_all_links(path[0][1])
-                raise PatchError("patch didn't create esky-bootstrap.txt")
+                err = "patch didn't create bootstrap-manifest.txt"
+                raise PatchError(err)
             # Make it available for upgrading
             rdpath = self._ready_name(app,version)
             if os.path.exists(rdpath):
@@ -238,7 +316,7 @@ class DefaultVersionFinder(VersionFinder):
         best_vdir = join_app_version(app.name,app.version,app.platform)
         source = os.path.join(app.appdir,best_vdir)
         shutil.copytree(source,os.path.join(uppath,best_vdir))
-        with open(os.path.join(source,"esky-bootstrap.txt"),"r") as manifest:
+        with open(os.path.join(source,ESKY_CONTROL_DIR,"bootstrap-manifest.txt"),"r") as manifest:
             for nm in manifest:
                 nm = nm.strip()
                 bspath = os.path.join(app.appdir,nm)
