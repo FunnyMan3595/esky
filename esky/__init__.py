@@ -155,7 +155,7 @@ from esky.util import split_app_version, join_app_version,\
                       is_version_dir, is_uninstalled_version_dir,\
                       parse_version, get_best_version, appdir_from_executable,\
                       copy_ownership_info, lock_version_dir, ESKY_CONTROL_DIR,\
-                      files_differ, lazy_import
+                      files_differ, lazy_import, is_locked_version_dir
 
 #  Since all frozen apps are required to import this module and call the
 #  run_startup_hooks() function, we use a simple lazy import mechanism to
