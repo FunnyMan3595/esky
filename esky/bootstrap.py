@@ -135,8 +135,8 @@ def bootstrap():
     chain-loads that version of the application.
     """
     appdir = appdir_from_executable(sys.executable)
-    #vsdir = pathjoin(appdir,"versions")
-    vsdir = appdir
+    vsdir = pathjoin(appdir,"versions")
+    #vsdir = appdir
     best_version = None
     if __esky_name__ is not None:
         best_version = get_best_version(vsdir,appname=__esky_name__)

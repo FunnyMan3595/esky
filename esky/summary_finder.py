@@ -16,7 +16,7 @@ from itertools import izip_longest
 from esky.finder import VersionFinder
 from esky.bootstrap import parse_version, join_app_version
 from esky.errors import *
-from esky.util import extract_zipfile
+from esky.util import deep_extract_zipfile
 from esky.patch import apply_patch, PatchError
 
 class EskyDownloadError(Exception):
@@ -627,8 +627,8 @@ more information.  Using a .esky suffix is recommended (though not required),
 as these files cannot be handled by the unix "patch" command.
     """
 
-    def __init__(self, summary_url):
-        self.summary_url = summary_url
+    def __init__(self, download_url):
+        self.summary_url = download_url
         super(SummaryVersionFinder,self).__init__()
         self.version_graph = None
 
@@ -740,7 +740,7 @@ as these files cannot be handled by the unix "patch" command.
         self.version_graph = SummaryVersionGraph(self.known_files, app)
         return self.version_graph.get_versions(app.version)
 
-    def fetch_version(self, app, version):
+    def fetch_version(self, app, version, callback=None):
         #  There's always the possibility that a patch fails to apply.
         #  We loop until we find a path that applies, or we run out of options.
         while True:
@@ -784,7 +784,7 @@ as these files cannot be handled by the unix "patch" command.
         else:
             # Clean install.
             base = path.pop(0)
-            extract_zipfile(base.get_full_filename(app), unpack_dir)
+            deep_extract_zipfile(base.get_full_filename(app), unpack_dir)
 
         # Apply all necessary patches.
         for patch_file in path:
@@ -795,8 +795,8 @@ as these files cannot be handled by the unix "patch" command.
                 apply_patch(unpack_dir, patch)
 
         # Move anything that's not the version dir into esky-bootstrap
-        version_dir = join_app_version(app.name, version, app.platform)
-        bootstrap_dir = os.path.join(unpack_dir, version_dir, "esky-bootstrap")
+        version_dir = "versions"
+        bootstrap_dir = os.path.join(unpack_dir, version_dir, join_app_version(app.name, version, app.platform), "esky-bootstrap")
         if not os.path.isdir(bootstrap_dir):
             os.makedirs(bootstrap_dir)
         for item in os.listdir(unpack_dir):
@@ -809,12 +809,14 @@ as these files cannot be handled by the unix "patch" command.
         ready_dir = self._get_ready_name(app, version)
         if os.path.exists(ready_dir):
             shutil.rmtree(ready_dir)
-        os.rename(os.path.join(unpack_dir, version_dir), ready_dir)
+        elif not os.path.exists(os.path.split(ready_dir)[0]):
+            os.makedirs(os.path.split(ready_dir)[0])
+        os.rename(os.path.join(unpack_dir, version_dir, join_app_version(app.name, version, app.platform)), ready_dir)
 
     def _copy_current_version(self, app, unpack_dir):
         # Get the current version.
         current_version = join_app_version(app.name,app.version,app.platform)
-        source = os.path.join(app.appdir, current_version)
+        source = os.path.join(app.appdir, "versions", current_version)
 
         # Copy it into place.
         shutil.copytree(source, os.path.join(unpack_dir, current_version))
@@ -848,7 +850,7 @@ as these files cannot be handled by the unix "patch" command.
 
     def _get_ready_name(self,app,version):
         version = join_app_version(app.name, version, app.platform)
-        return os.path.join(self._workdir(app,"ready"), version)
+        return os.path.join(self._workdir(app,"ready"), "versions", version)
 
 
 class SummaryVersionGraph(object):

@@ -288,8 +288,8 @@ class DefaultVersionFinder(VersionFinder):
                         raise
             # Move anything that's not the version dir into esky/bootstrap
             vdir = join_app_version(app.name,version,app.platform)
-            #vsdir = os.path.join(uppath,"versions")
-            vsdir = uppath
+            vsdir = os.path.join(uppath,"versions")
+            #vsdir = uppath
             bspath = os.path.join(vsdir,vdir,ESKY_CONTROL_DIR,"bootstrap")
             if not os.path.isdir(bspath):
                 os.makedirs(bspath)
@@ -314,12 +314,12 @@ class DefaultVersionFinder(VersionFinder):
             shutil.rmtree(uppath)
 
     def _copy_best_version(self,app,uppath):
-        best_vdir = join_app_version(app.name,app.version,app.platform)
-        source = os.path.join(app.appdir,best_vdir)
-        shutil.copytree(source,os.path.join(uppath,best_vdir))
-        #source = os.path.join(app.appdir,"versions",best_vdir)
-        #os.mkdir(os.path.join(uppath,"versions"))
-        #shutil.copytree(source,os.path.join(uppath,"versions",best_vdir))
+        #best_vdir = join_app_version(app.name,app.version,app.platform)
+        #source = os.path.join(app.appdir,best_vdir)
+        #shutil.copytree(source,os.path.join(uppath,best_vdir))
+        source = os.path.join(app.appdir,"versions",best_vdir)
+        os.mkdir(os.path.join(uppath,"versions"))
+        shutil.copytree(source,os.path.join(uppath,"versions",best_vdir))
         with open(os.path.join(source,ESKY_CONTROL_DIR,"bootstrap-manifest.txt"),"r") as manifest:
             for nm in manifest:
                 nm = nm.strip()
