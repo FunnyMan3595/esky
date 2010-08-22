@@ -326,7 +326,9 @@ class bdist_esky(Command):
         if hasattr(self.freezer_module,"zipit"):
             self.freezer_module.zipit(self,self.bootstrap_dir,zfname)
         else:
-            create_zipfile(self.bootstrap_dir,zfname,compress=True)
+            name = self.distribution.get_name()
+            wrap = lambda fpath: os.path.join(name, fpath)
+            create_zipfile(self.bootstrap_dir,zfname,wrap,compress=True)
         shutil.rmtree(self.bootstrap_dir)
 
     def _obj2code(self,obj):
